@@ -28,15 +28,15 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the threat model and a fr
 ## Install
 
 ```sh
-brew tap vshuraeff/brew-autosign
-brew install vshuraeff/brew-autosign/brew-autosign
+brew tap vshuraeff/autosign
+brew install vshuraeff/autosign/brew-autosign
 brew-autosign setup
 ```
 
 For the bleeding edge instead of the latest release:
 
 ```sh
-brew install --HEAD vshuraeff/brew-autosign/brew-autosign
+brew install --HEAD vshuraeff/autosign/brew-autosign
 ```
 
 `setup` is interactive once — it generates the cert, imports it into your login keychain, trusts it for the `codeSign` policy (one Keychain password prompt), creates a default config, and starts the LaunchAgent.
