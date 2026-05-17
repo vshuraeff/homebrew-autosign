@@ -59,6 +59,8 @@ Each subcommand also accepts `--help`.
 
 After install, on first use of a Keychain-backed tool (e.g. `fnox`), macOS will prompt **once per existing secret** to bind the new stable signature to the ACL. Click **"Always Allow"** every time (it's per-secret, not per-invocation). Subsequent `brew upgrade`s are silent forever.
 
+![macOS Keychain prompt asking whether to allow fnox to read a secret — click "Always Allow"](docs/images/SCR-20260517-rtqv-2.png)
+
 ## Config
 
 `~/.config/brew-autosign/packages.conf` — one entry per line, two forms:
