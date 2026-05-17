@@ -40,6 +40,8 @@ The single command that answers "is everything working?" is `brew-autosign statu
 
 3. If the binary **is** signed correctly but Keychain still prompts, the ACL on those pre-existing items still references the **old** designated requirement (an unsigned-binary hash or a different identity). Click "Always Allow" on each prompt; the ACL will be updated to trust the new stable identity. Future upgrades will be silent.
 
+   ![macOS Keychain prompt — choose "Always Allow"](images/SCR-20260517-rtqv-2.png)
+
 ## Symptom: `setup` says "MAC verification failed during PKCS12 import"
 
 OpenSSL 3's default modern PKCS12 export format which the macOS `security` tool does not understand. `brew-autosign setup` already uses `-legacy`; if you somehow regenerated the p12 file manually without it, delete the cert material and re-run setup:

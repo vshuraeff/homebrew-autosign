@@ -80,6 +80,8 @@ Existing Keychain items installed *before* `brew-autosign setup` still have ACL 
 
 In practice this means the first time the freshly-signed tool tries to read each pre-existing secret, the user gets one GUI prompt per secret. Clicking **"Always Allow"** binds the new (stable) DR to that ACL. Future upgrades that re-sign with the same identity satisfy the new DR silently.
 
+![macOS Keychain prompt asking whether to allow fnox to read a secret — click "Always Allow" once per item to bind the new stable signature to the ACL](images/SCR-20260517-rtqv-2.png)
+
 This pain happens **once** for items created before `brew-autosign` was installed. Items created after install start with the stable DR from the outset.
 
 ## Components
