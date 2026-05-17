@@ -1,0 +1,9 @@
+# Developer-time dependencies for brew-autosign maintenance.
+# Install with:  brew bundle install --file=Brewfile.dev
+#
+# These are NOT runtime dependencies of brew-autosign itself (those live in
+# Formula/brew-autosign.rb). They are used by release tooling under scripts/.
+
+brew "svu"        # semantic version utility — computes next version from Conventional Commits
+brew "git-cliff"  # CHANGELOG generator from Conventional Commits
+brew "shellcheck" # bash linter (also run in CI)

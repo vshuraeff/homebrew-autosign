@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./bin
+          severity: warning
+        env:
+          # the script is bash, not /bin/sh; declare shell explicitly via shebang
+          SHELLCHECK_OPTS: -e SC1090 -e SC1091
+
+  smoke-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n bin/brew-autosign
+
+      - name: Help output
+        run: bin/brew-autosign help
+
+      - name: Subcommand --help
+        run: |
+          bin/brew-autosign add --help
+          bin/brew-autosign remove --help
+          bin/brew-autosign uninstall --help
+
+      - name: Input validation rejects bad package names AND leaves config untouched
+        run: |
+          set +e
+          tmp=$(mktemp -d)
+          export HOME=$tmp
+          mkdir -p "$tmp/.config/brew-autosign"
+          # seed an existing config so we can assert it's unchanged after rejections
+          printf 'fnox\n' > "$tmp/.config/brew-autosign/packages.conf"
+          orig=$(shasum -a 256 "$tmp/.config/brew-autosign/packages.conf" | awk '{print $1}')
+          for bad in '../etc/passwd' 'pkg<inj>' 'fnox:has space' 'fnox:../etc' 'FOO' 'pkg;rm'; do
+            out=$(bin/brew-autosign add "$bad" 2>&1); rc=$?
+            [[ $rc -ne 0 ]] || { echo "expected failure for: $bad"; exit 1; }
+          done
+          new=$(shasum -a 256 "$tmp/.config/brew-autosign/packages.conf" | awk '{print $1}')
+          [[ "$orig" == "$new" ]] || { echo "packages.conf changed despite rejection"; exit 1; }
+          echo "all rejections fired AND config unchanged"
+          rm -rf "$tmp"
+
+      - name: Plist generation lint
+        run: |
+          # exercise generate_plist by running `reload` against a temp HOME
+          tmp=$(mktemp -d)
+          HOME=$tmp bin/brew-autosign add fnox 2>&1 || true
+          # if reload failed (launchctl not in CI's user GUI session), still
+          # validate any generated plist we managed to write
+          plist=$tmp/Library/LaunchAgents/dev.brew-autosign.plist
+          if [[ -f "$plist" ]]; then
+            plutil -lint "$plist"
+          else
+            echo "no plist generated (launchctl bootstrap unavailable in CI); skipping lint"
+          fi
+          rm -rf "$tmp"
+
+      - name: Brew formula parse + audit
+        run: |
+          brew tap-new local/test --no-git
+          cp Formula/brew-autosign.rb "$(brew --repo local/test)/Formula/"
+          # parse-level validity is REQUIRED (fail CI if formula does not load)
+          brew formula local/test/brew-autosign
+          # audit is INFORMATIONAL only until the v0.1.0 tarball ships a real
+          # sha256; flip to required (drop `|| true`) once the placeholder is
+          # replaced in Formula/brew-autosign.rb.
+          brew audit --strict --new --formula local/test/brew-autosign || \
+            brew audit --formula local/test/brew-autosign || true

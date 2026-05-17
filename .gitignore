@@ -1,0 +1,15 @@
+# local cert/key material — never commit
+*.crt
+*.key
+*.p12
+*.pem
+
+# editor / OS junk
+.DS_Store
+*.swp
+*~
+
+# packaging artifacts
+*.tar.gz
+*.tgz
+dist/

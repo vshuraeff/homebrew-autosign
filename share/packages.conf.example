@@ -1,0 +1,48 @@
+# brew-autosign packages.conf
+#
+# Lists Homebrew packages whose binaries should be auto-signed with the local
+# code-signing identity after every `brew upgrade`, so that macOS Keychain ACLs
+# stay valid across upgrades.
+#
+# ─── Syntax ───────────────────────────────────────────────────────────────
+# One entry per line. Two forms are supported:
+#
+#   <package>
+#       Sign every UNSIGNED Mach-O executable found in
+#           <brew-prefix>/Cellar/<package>/<version>/bin/
+#       (Already-signed binaries — by Apple, the vendor, or by us — are left
+#       alone; see "Safety" below.)
+#
+#   <package>:<binary1>,<binary2>,...
+#       Sign only the explicitly listed binaries inside the package's bin/
+#       directory. Useful when a package ships many tools and you only need
+#       a subset re-signed.
+#
+# Whitespace is ignored. Comments start with `#`. Blank lines are ignored.
+#
+# ─── Fields ───────────────────────────────────────────────────────────────
+#   <package>   — the exact Homebrew formula name as installed (matches the
+#                 directory under Cellar/). For tap-installed formulae use the
+#                 unqualified leaf name (e.g. `fnox`, not `user/tap/fnox`).
+#   <binary>    — the file name inside the package's bin/ directory.
+#
+# ─── Safety ───────────────────────────────────────────────────────────────
+# brew-autosign never overwrites an existing signature. Each binary is
+# classified as:
+#   - signed by us           → skipped (idempotent)
+#   - signed by someone else → skipped (Apple / vendor signature preserved)
+#   - not signed at all      → signed with the local identity
+#
+# ─── After editing ────────────────────────────────────────────────────────
+# Run:
+#   brew-autosign reload
+# to regenerate the LaunchAgent's WatchPaths from the new list.
+#
+# ─── Examples ─────────────────────────────────────────────────────────────
+# Uncomment to enable.
+
+# fnox                      # secret manager — needs stable signature for keychain ACLs
+# yubikey-agent             # any unsigned tool you trust enough to local-sign
+
+# Restrict to specific binaries when a package ships many tools:
+# my-pkg:cli,daemon

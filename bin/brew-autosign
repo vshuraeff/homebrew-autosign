@@ -1,0 +1,1345 @@
+#!/usr/bin/env bash
+# brew-autosign: auto re-sign Homebrew-installed binaries with a stable local
+# codesign identity so macOS Keychain ACLs survive `brew upgrade`.
+#
+# Subcommands:
+#   setup           one-time setup: generate cert, import to keychain, install agent
+#   sign            run a signing pass now (idempotent; used by the LaunchAgent)
+#   reload          regenerate the LaunchAgent plist from packages.conf and reload it
+#   add <pkg>       append <pkg>[:bin1,bin2,...] to packages.conf and reload
+#   remove <pkg>    remove <pkg> from packages.conf and reload
+#   list            show configured packages and their current signing status
+#   status          health summary, agent state, watched paths, recent log
+#   uninstall       unload and remove the LaunchAgent (use --purge to also remove cert + config)
+#   completions <install|uninstall|generate> <zsh|bash|fish|auto>
+#                   manage shell tab-completion
+#   help            this help
+
+set -uo pipefail
+# Note: deliberately NOT using `set -e`. We handle exit codes explicitly via
+# `return` / `die` / `|| true`; `-e` interacts badly with `while read`, command
+# substitution in `local`, and conditional pipelines used throughout.
+
+umask 077
+[[ "$(uname -s)" == "Darwin" ]] || { echo "brew-autosign: macOS only" >&2; exit 1; }
+
+# --- constants -----------------------------------------------------------
+
+IDENTITY="brew-autosign-local"
+LABEL="dev.brew-autosign"
+CONFIG_DIR="$HOME/.config/brew-autosign"
+CONFIG="$CONFIG_DIR/packages.conf"
+DATA_DIR="$HOME/.local/share/brew-autosign"
+LOG="$DATA_DIR/log.txt"
+SIGN_LOCK="$DATA_DIR/.sign.lock"
+CONFIG_LOCK="$DATA_DIR/.config.lock"
+LAST_RUN="$DATA_DIR/.last_run"
+CERT_FILE="$DATA_DIR/codesign.crt"      # only public part kept on disk
+PLIST="$HOME/Library/LaunchAgents/dev.brew-autosign.plist"
+
+DEBOUNCE_SECONDS=2
+LOG_MAX_BYTES=1048576
+BACKSTOP_INTERVAL_SECONDS=3600   # hourly periodic sign pass as WatchPaths backstop
+STABILITY_MAX_TRIES=10
+STABILITY_SLEEP_SECONDS=0.2
+EXPIRY_WARN_DAYS=365
+
+# brew formula name format per Homebrew core: leading [a-z0-9], then
+# [a-z0-9._+@-]. We accept the same set; reject everything else.
+NAME_RE='^[a-z0-9][a-z0-9._+@-]{0,127}$'
+
+# --- bootstrap dirs (mode 700 for DATA_DIR; CONFIG_DIR can stay user-default) ---
+
+mkdir -p "$DATA_DIR" "$CONFIG_DIR"
+chmod 700 "$DATA_DIR" 2>/dev/null || true
+
+# --- prefixes ------------------------------------------------------------
+
+# resolve all candidate Homebrew prefixes. Order matters for first-match wins;
+# we walk all of them anyway for `sign_package`.
+homebrew_prefixes() {
+  local seen=()
+  local p
+  for p in "${HOMEBREW_PREFIX:-}" /usr/local /opt/homebrew; do
+    [[ -z "$p" ]] && continue
+    [[ -d "$p" ]] || continue
+    local already=0 q
+    for q in "${seen[@]:-}"; do [[ "$q" == "$p" ]] && already=1 && break; done
+    (( already == 0 )) && seen+=("$p")
+  done
+  # also try brew(1) if reachable
+  local brew_prefix
+  brew_prefix=$(command -v brew >/dev/null 2>&1 && brew --prefix 2>/dev/null || true)
+  if [[ -n "$brew_prefix" && -d "$brew_prefix" ]]; then
+    local already=0 q
+    for q in "${seen[@]:-}"; do [[ "$q" == "$brew_prefix" ]] && already=1 && break; done
+    (( already == 0 )) && seen+=("$brew_prefix")
+  fi
+  printf '%s\n' "${seen[@]:-}"
+}
+
+# --- flock -----------------------------------------------------------------
+
+# Resolve flock from known Homebrew prefixes only. We deliberately do NOT
+# fall back to `command -v flock` because the agent's PATH includes
+# user-writable locations; a malicious flock binary in PATH would compromise
+# the agent. Custom HOMEBREW_PREFIX is honored, matching homebrew_prefixes().
+FLOCK=""
+for _pfx in "${HOMEBREW_PREFIX:-}" /usr/local /opt/homebrew; do
+  [[ -z "$_pfx" ]] && continue
+  if [[ -x "$_pfx/bin/flock" ]]; then FLOCK="$_pfx/bin/flock"; break; fi
+done
+unset _pfx
+
+# --- helpers ---------------------------------------------------------------
+
+log() {
+  local lvl="${1:-info}"; shift
+  printf '%s %-5s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$lvl" "$*" >>"$LOG"
+}
+
+die() { echo "brew-autosign: $*" >&2; exit 1; }
+
+# Terminal styling resolved from terminfo via tput. Empty when stdout is
+# piped, TERM is dumb, or tput is unavailable — no hardcoded escape codes
+# anywhere in the script.
+if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]] && command -v tput >/dev/null 2>&1; then
+  _BOLD=$(tput bold 2>/dev/null || printf '')
+  _RESET=$(tput sgr0 2>/dev/null || printf '')
+else
+  _BOLD=''
+  _RESET=''
+fi
+
+# Section header: bold title followed by `─` underline of the same width.
+hdr() {
+  local title=$1
+  local i len=${#title} dash=""
+  for ((i=0; i<len; i++)); do dash="${dash}─"; done
+  printf '%s%s%s\n%s\n' "$_BOLD" "$title" "$_RESET" "$dash"
+}
+
+# warn(): interactive runs see the message on stderr; non-interactive runs
+# (LaunchAgent → agent.err.log) write into the rotated log.txt instead, to
+# prevent a malformed config from inflating agent.err.log unboundedly across
+# the hourly StartInterval backstop.
+warn() {
+  if [[ -t 2 ]]; then
+    echo "brew-autosign: warning: $*" >&2
+  else
+    log warn "$*"
+  fi
+}
+
+# self-path resolution (used by generate_plist for ProgramArguments)
+resolve_self() {
+  local s
+  s=$(command -v brew-autosign 2>/dev/null || true)
+  if [[ -z "$s" ]]; then
+    s="${BASH_SOURCE[0]}"
+    [[ "$s" != /* ]] && s="$(pwd)/$s"
+  fi
+  echo "$s"
+}
+
+# example config lookup (used by `setup`)
+find_example_config() {
+  local self_dir candidates
+  self_dir=$(dirname "$(resolve_self)")
+  candidates=(
+    "/usr/local/share/brew-autosign/packages.conf.example"
+    "/opt/homebrew/share/brew-autosign/packages.conf.example"
+    "$self_dir/../share/brew-autosign/packages.conf.example"
+    "$self_dir/../share/packages.conf.example"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -f "$c" ]] && { echo "$c"; return; }
+  done
+  return 1
+}
+
+require_flock() {
+  [[ -n "$FLOCK" ]] || die "flock not found under \${HOMEBREW_PREFIX}/bin, /usr/local/bin, or /opt/homebrew/bin — install: brew install util-linux"
+}
+
+# XML-escape a value before embedding into plist <string>
+xml_escape() {
+  local s=$1
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  s=${s//\'/&apos;}
+  printf '%s' "$s"
+}
+
+# Validate a brew package name. Returns 0 on accept, 1 on reject.
+valid_pkg_name() {
+  local n=$1
+  [[ "$n" =~ $NAME_RE ]]
+}
+
+# Validate a binary file name (basename, no path components, no traversal).
+valid_bin_name() {
+  local n=$1
+  [[ -z "$n" ]] && return 1
+  case "$n" in
+    */*|.|..|*'..'*) return 1 ;;
+  esac
+  # printable, no control chars, no whitespace
+  case "$n" in
+    *[[:cntrl:]]*|*[[:space:]]*) return 1 ;;
+  esac
+  return 0
+}
+
+# Trim leading/trailing whitespace from a string.
+trim() {
+  local s=$1
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# --- config helpers ------------------------------------------------------
+
+# yields tab-separated lines: <pkg>\t<bin1,bin2,...>   (binaries column may be empty).
+# Policy: rejects malformed lines with a stderr warning and continues. We
+# deliberately do NOT abort on a bad line — one corrupted entry should not
+# silence auto-signing for every other configured package. `add` and `remove`
+# validate at write time so config corruption is rare; this is recovery
+# behavior for hand-edited or merged-from-dotfiles configs.
+read_config() {
+  [[ -f "$CONFIG" ]] || return 0
+  local line pkg bins lineno=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno+1))
+    line="${line%%#*}"
+    line=$(trim "$line")
+    [[ -z "$line" ]] && continue
+    if [[ "$line" == *":"* ]]; then
+      pkg="${line%%:*}"; bins="${line#*:}"
+    else
+      pkg="$line"; bins=""
+    fi
+    pkg=$(trim "$pkg")
+    if ! valid_pkg_name "$pkg"; then
+      warn "$CONFIG:$lineno: invalid package name '$pkg' (rejected)"
+      continue
+    fi
+    if [[ -n "$bins" ]]; then
+      local trimmed_bins="" b
+      local -a parts
+      IFS=',' read -ra parts <<<"$bins"
+      local accept=1
+      for b in "${parts[@]}"; do
+        b=$(trim "$b")
+        if ! valid_bin_name "$b"; then
+          warn "$CONFIG:$lineno: invalid binary name '$b' (line rejected)"
+          accept=0; break
+        fi
+        trimmed_bins="${trimmed_bins:+${trimmed_bins},}$b"
+      done
+      (( accept == 0 )) && continue
+      bins="$trimmed_bins"
+    fi
+    printf '%s\t%s\n' "$pkg" "$bins"
+  done <"$CONFIG"
+  return 0
+}
+
+# echo all watch paths that currently exist on disk for configured packages.
+watch_paths() {
+  local pkg _ prefix
+  local -a prefixes=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  while IFS=$'\t' read -r pkg _ || [[ -n "$pkg" ]]; do
+    [[ -z "$pkg" ]] && continue
+    for prefix in "${prefixes[@]:-}"; do
+      [[ -z "$prefix" ]] && continue
+      [[ -d "$prefix/Cellar/$pkg" ]] && echo "$prefix/Cellar/$pkg"
+      [[ -L "$prefix/opt/$pkg" || -d "$prefix/opt/$pkg" ]] && echo "$prefix/opt/$pkg"
+    done
+  done < <(read_config)
+  return 0
+}
+
+# echo packages from config that are NOT installed in any known prefix.
+unwatched_packages() {
+  local pkg _ prefix found
+  local -a prefixes=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  while IFS=$'\t' read -r pkg _ || [[ -n "$pkg" ]]; do
+    [[ -z "$pkg" ]] && continue
+    found=0
+    for prefix in "${prefixes[@]:-}"; do
+      [[ -z "$prefix" ]] && continue
+      [[ -d "$prefix/Cellar/$pkg" ]] && { found=1; break; }
+    done
+    (( found == 0 )) && echo "$pkg"
+  done < <(read_config)
+  return 0
+}
+
+# --- signing -------------------------------------------------------------
+
+is_executable_macho() {
+  local f=$1
+  [[ -f "$f" && -x "$f" ]] || return 1
+  # read first 4 bytes; require xxd or od fallback
+  local hdr
+  if command -v xxd >/dev/null 2>&1; then
+    hdr=$(head -c 4 "$f" 2>/dev/null | xxd -p 2>/dev/null || true)
+  else
+    hdr=$(head -c 4 "$f" 2>/dev/null | od -An -tx1 -N4 2>/dev/null | tr -d ' \n' || true)
+  fi
+  # thin Mach-O (LE/BE, 32/64) and fat Mach-O (32/64, LE/BE)
+  case "$hdr" in
+    cffaedfe|cefaedfe|feedfacf|feedface|bebafeca|cafebabe|bfbafeca|cafebabf) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Provenance check: verify a version directory came from brew. Without this,
+# anyone with write-access to Cellar can drop a binary at
+# Cellar/<configured-pkg>/999/bin/<configured-bin> and the agent would sign it.
+#
+# An attacker with write-access to Cellar can also `touch INSTALL_RECEIPT.json`,
+# so existence alone is insufficient. We require:
+#   1. The file is at least 32 bytes.
+#   2. It contains the JSON keys Homebrew unconditionally writes:
+#      "homebrew_version" and one of "poured_from_bottle" / "built_as_bottle".
+# This raises the attacker effort from `touch` to "reproduce part of brew's
+# install pipeline" without depending on jq.
+is_brew_installed_keg() {
+  local receipt="${1}INSTALL_RECEIPT.json"
+  [[ -f "$receipt" ]] || return 1
+  local sz
+  sz=$(stat -f %z "$receipt" 2>/dev/null || echo 0)
+  (( sz >= 32 )) || return 1
+  grep -q '"homebrew_version"' "$receipt" 2>/dev/null || return 1
+  grep -qE '"(poured_from_bottle|built_as_bottle|installed_on_request)"' "$receipt" 2>/dev/null || return 1
+  return 0
+}
+
+# Wait until file size AND mtime are stable across two consecutive reads.
+# Returns 0 if stable, 1 if file never appears or never stabilizes.
+# Checking both size and mtime defeats a writer that pauses at a constant
+# size (rare in practice, but cheap to defend against).
+wait_for_stable_file() {
+  local f=$1
+  local prev="" cur tries=0
+  while (( tries < STABILITY_MAX_TRIES )); do
+    [[ -f "$f" ]] || { sleep "$STABILITY_SLEEP_SECONDS"; tries=$((tries+1)); continue; }
+    cur=$(stat -f '%z:%m' "$f" 2>/dev/null || echo "")
+    if [[ -n "$cur" && "$cur" == "$prev" ]]; then return 0; fi
+    prev=$cur
+    sleep "$STABILITY_SLEEP_SECONDS"
+    tries=$((tries+1))
+  done
+  return 1
+}
+
+# 0 = signed by us, 1 = unsigned, 2 = signed by someone else, 3 = codesign error
+sig_state() {
+  local out rc
+  out=$(/usr/bin/codesign -dv --verbose=2 "$1" 2>&1)
+  rc=$?
+  if echo "$out" | grep -q '^Authority='; then
+    if echo "$out" | grep -qE "^Authority=${IDENTITY}\$"; then
+      return 0
+    fi
+    return 2
+  fi
+  if echo "$out" | grep -q 'code object is not signed at all'; then
+    return 1
+  fi
+  # any other codesign failure: treat as error, NOT silently skip
+  log error "codesign -dv unexpected output for $1 (rc=$rc): $(echo "$out" | head -1)"
+  return 3
+}
+
+# Verify our identity is actually usable: importable + key accessible.
+# Returns 0 if the keychain identity can sign right now.
+preflight_identity() {
+  if ! /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+       | grep -qE "\"${IDENTITY}\""; then
+    log error "preflight: identity '$IDENTITY' not found in keychain (run: brew-autosign setup)"
+    return 1
+  fi
+  return 0
+}
+
+sign_one() {
+  local bin=$1
+  is_executable_macho "$bin" || return 0
+  local rc=0
+  sig_state "$bin"; rc=$?
+  case $rc in
+    0) return 0 ;;  # already ours
+    2) return 0 ;;  # signed by other — never overwrite
+    3) return 1 ;;  # codesign error — surface
+    1) ;;           # unsigned — proceed
+    *) return 1 ;;
+  esac
+
+  # stability: don't sign a file brew might still be writing
+  if ! wait_for_stable_file "$bin"; then
+    log warn "skip $bin: file did not stabilize"
+    return 1
+  fi
+
+  log info "signing $bin"
+  if /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none "$bin" >>"$LOG" 2>&1; then
+    log info "signed OK: $bin"
+    return 0
+  else
+    log error "codesign failed for $bin"
+    return 1
+  fi
+}
+
+# sign one package. Returns number of failures via global SIGN_FAILS.
+sign_package() {
+  local pkg=$1 bins_csv=$2
+  local prefix cellar ver_dir bin b
+  local -a prefixes=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  local seen_keg=0
+  for prefix in "${prefixes[@]:-}"; do
+    [[ -z "$prefix" ]] && continue
+    cellar="$prefix/Cellar/$pkg"
+    [[ -d "$cellar" ]] || continue
+    for ver_dir in "$cellar"/*/; do
+      [[ -d "$ver_dir" ]] || continue
+      seen_keg=1
+      # provenance: refuse to sign anything inside a non-brew-installed keg
+      if ! is_brew_installed_keg "$ver_dir"; then
+        log warn "skip $ver_dir: no INSTALL_RECEIPT.json (not a brew keg)"
+        continue
+      fi
+      if [[ -n "$bins_csv" ]]; then
+        IFS=',' read -ra wanted <<<"$bins_csv"
+        for b in "${wanted[@]}"; do
+          sign_one "${ver_dir}bin/$b" || SIGN_FAILS=$((SIGN_FAILS+1))
+        done
+      else
+        for bin in "${ver_dir}bin/"*; do
+          [[ -e "$bin" ]] || continue
+          sign_one "$bin" || SIGN_FAILS=$((SIGN_FAILS+1))
+        done
+      fi
+    done
+  done
+  (( seen_keg == 0 )) && log info "skip: $pkg not installed in any known prefix"
+  return 0
+}
+
+# --- subcommand: sign ----------------------------------------------------
+
+cmd_sign() {
+  require_flock
+
+  # rotate log under the sign lock (so two passes don't both rotate)
+  if [[ -f "$LOG" && $(stat -f %z "$LOG" 2>/dev/null || echo 0) -gt $LOG_MAX_BYTES ]]; then
+    # benign if it races: mv is atomic
+    mv "$LOG" "$LOG.old" 2>/dev/null || true
+  fi
+
+  exec 9>"$SIGN_LOCK"
+  if ! "$FLOCK" -n 9; then
+    log info "another sign pass running, skipping"
+    return 0
+  fi
+
+  # debounce: skip if successful run <DEBOUNCE_SECONDS ago.
+  # clamp future timestamps (clock skew / time travel / restored from backup).
+  local now last=0
+  now=$(date +%s)
+  if [[ -f "$LAST_RUN" ]]; then
+    local raw
+    raw=$(cat "$LAST_RUN" 2>/dev/null | tr -dc '0-9' | head -c 12)
+    if [[ -n "$raw" ]]; then
+      last=$raw
+      if (( last > now )); then
+        log warn "future timestamp in $LAST_RUN ($last > $now); resetting"
+        last=0
+      fi
+    fi
+  fi
+  if (( now - last < DEBOUNCE_SECONDS )); then
+    return 0
+  fi
+
+  # identity preflight: warn (but proceed; some configured pkgs may still
+  # benefit from a status pass even if we can't sign right now).
+  if ! preflight_identity; then
+    return 1
+  fi
+
+  SIGN_FAILS=0
+  local pkg bins
+  while IFS=$'\t' read -r pkg bins || [[ -n "$pkg" ]]; do
+    [[ -z "$pkg" ]] && continue
+    sign_package "$pkg" "$bins"
+  done < <(read_config)
+
+  echo "$now" >"$LAST_RUN"
+
+  if (( SIGN_FAILS > 0 )); then
+    log error "$SIGN_FAILS binaries failed to sign"
+    # When run by launchd, returning non-zero is fine — launchd won't restart
+    # because we don't request KeepAlive. Manual users see the exit code.
+    return 1
+  fi
+  return 0
+}
+
+# --- subcommand: reload --------------------------------------------------
+
+generate_plist() {
+  local self
+  self=$(resolve_self)
+  local -a paths=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && paths+=("$_p"); done < <(watch_paths | sort -u)
+
+  mkdir -p "$(dirname "$PLIST")"
+  local tmp="$PLIST.tmp"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0">'
+    echo '<dict>'
+    echo "    <key>Label</key>"
+    echo "    <string>$(xml_escape "$LABEL")</string>"
+    echo "    <key>ProgramArguments</key>"
+    echo "    <array>"
+    echo "        <string>/bin/bash</string>"
+    echo "        <string>$(xml_escape "$self")</string>"
+    echo "        <string>sign</string>"
+    echo "    </array>"
+    echo "    <key>RunAtLoad</key><true/>"
+    echo "    <key>StartInterval</key><integer>$BACKSTOP_INTERVAL_SECONDS</integer>"
+    echo "    <key>EnvironmentVariables</key>"
+    echo "    <dict>"
+    echo "        <key>PATH</key>"
+    echo "        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
+    echo "    </dict>"
+    if (( ${#paths[@]} > 0 )); then
+      echo "    <key>WatchPaths</key>"
+      echo "    <array>"
+      local p
+      for p in "${paths[@]}"; do
+        [[ -z "$p" ]] && continue
+        echo "        <string>$(xml_escape "$p")</string>"
+      done
+      echo "    </array>"
+    fi
+    echo "    <key>StandardOutPath</key>"
+    echo "    <string>$(xml_escape "$DATA_DIR/agent.out.log")</string>"
+    echo "    <key>StandardErrorPath</key>"
+    echo "    <string>$(xml_escape "$DATA_DIR/agent.err.log")</string>"
+    echo "    <key>ProcessType</key><string>Background</string>"
+    echo "    <key>ThrottleInterval</key><integer>2</integer>"
+    echo '</dict>'
+    echo '</plist>'
+  } >"$tmp"
+
+  # validate BEFORE moving into place
+  if ! plutil -lint "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    die "generated plist failed plutil -lint; refusing to install"
+  fi
+  mv "$tmp" "$PLIST"
+}
+
+cmd_reload() {
+  generate_plist || die "plist generation failed"
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchctl bootstrap failed"
+  printf 'reloaded: %s\n' "$LABEL"
+  local -a paths=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && paths+=("$_p"); done < <(watch_paths | sort -u)
+  if (( ${#paths[@]} > 0 )); then
+    printf 'watching:\n'
+    local p
+    for p in "${paths[@]}"; do
+      echo "  $p"
+    done
+  else
+    printf 'watching: (none — packages.conf is empty or all packages not yet installed)\n'
+  fi
+  # warn about configured-but-not-installed packages
+  local -a unwatched=(); local _u
+  while IFS= read -r _u; do [[ -n "$_u" ]] && unwatched+=("$_u"); done < <(unwatched_packages)
+  if (( ${#unwatched[@]} > 0 )); then
+    printf 'configured but not installed (no watch path):\n'
+    local u
+    for u in "${unwatched[@]}"; do
+      echo "  $u — install it, then run: brew-autosign reload"
+    done
+  fi
+  return 0
+}
+
+# --- subcommand: add / remove --------------------------------------------
+
+# parse `<pkg>[:<bin1>,<bin2>,...]`, validate, normalize. Echoes normalized form.
+# On invalid input calls die(), which (because callers use $(parse_entry ...)
+# in command substitution) terminates the entire script via exit. That is
+# intentional: validation errors are unrecoverable and must surface loudly.
+parse_entry() {
+  local raw=$1 pkg bins
+  raw=$(trim "$raw")
+  if [[ "$raw" == *":"* ]]; then
+    pkg="${raw%%:*}"; bins="${raw#*:}"
+  else
+    pkg="$raw"; bins=""
+  fi
+  pkg=$(trim "$pkg")
+  valid_pkg_name "$pkg" || die "invalid package name '$pkg' (must match brew formula naming)"
+  if [[ -n "$bins" ]]; then
+    local -a parts; local out="" b
+    IFS=',' read -ra parts <<<"$bins"
+    for b in "${parts[@]}"; do
+      b=$(trim "$b")
+      valid_bin_name "$b" || die "invalid binary name '$b' (basename only, no slashes or spaces)"
+      out="${out:+${out},}$b"
+    done
+    printf '%s:%s\n' "$pkg" "$out"
+  else
+    printf '%s\n' "$pkg"
+  fi
+}
+
+with_config_lock() {
+  require_flock
+  exec 8>"$CONFIG_LOCK"
+  "$FLOCK" 8 || die "could not acquire config lock"
+  "$@"
+  local rc=$?
+  exec 8>&-
+  return $rc
+}
+
+config_check_warn_not_installed() {
+  local pkg=$1
+  local -a prefixes=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  local p found=0
+  for p in "${prefixes[@]:-}"; do
+    [[ -z "$p" ]] && continue
+    [[ -d "$p/Cellar/$pkg" ]] && { found=1; break; }
+  done
+  (( found == 0 )) && warn "$pkg is not installed in any Homebrew prefix; agent will start watching it after \`brew install $pkg && brew-autosign reload\`"
+}
+
+_cmd_add_inner() {
+  local raw=$1 normalized key
+  normalized=$(parse_entry "$raw") || return 1
+  key="${normalized%%:*}"
+  [[ -f "$CONFIG" ]] || touch "$CONFIG"
+  if grep -qE "^${key}([[:space:]]*:|[[:space:]]*\$)" "$CONFIG" 2>/dev/null; then
+    echo "already present: $key"
+    return 0
+  fi
+  printf '%s\n' "$normalized" >>"$CONFIG"
+  config_check_warn_not_installed "$key"
+  return 0
+}
+
+cmd_add() {
+  [[ $# -ge 1 ]] || die "usage: brew-autosign add <pkg>[:bin1,bin2,...]"
+  with_config_lock _cmd_add_inner "$1" || return 1
+  cmd_reload
+}
+
+_cmd_remove_inner() {
+  local pkg=$1
+  valid_pkg_name "$pkg" || die "invalid package name '$pkg'"
+  [[ -f "$CONFIG" ]] || die "no config at $CONFIG"
+  # use literal-string per-line match to avoid regex injection.
+  # cmd_remove targets the FIRST whitespace-delimited token on each line.
+  # Temp file MUST live in the same directory as $CONFIG so that `mv` is an
+  # atomic rename (same-filesystem); a cross-fs move would silently degrade
+  # to copy+delete and lose atomicity.
+  local tmp; tmp=$(mktemp "${CONFIG}.XXXXXX") || die "mktemp failed"
+  # shellcheck disable=SC2064  # want trap to capture current value of $tmp
+  trap "rm -f '$tmp'" RETURN
+  local line line_pkg removed=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_pkg=$(trim "${line%%[#:]*}")
+    if [[ "$line_pkg" == "$pkg" ]]; then
+      removed=1
+      continue
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+  done <"$CONFIG"
+  if (( removed == 0 )); then
+    # nothing changed: clean tmp explicitly (trap will also fire, idempotent)
+    rm -f "$tmp"
+    trap - RETURN
+    echo "not in config: $pkg"
+    return 0
+  fi
+  mv "$tmp" "$CONFIG" || die "failed to write $CONFIG"
+  trap - RETURN
+  return 0
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "usage: brew-autosign remove <pkg>"
+  with_config_lock _cmd_remove_inner "$1" || return 1
+  cmd_reload
+}
+
+# --- subcommand: list / status -------------------------------------------
+
+status_of() {
+  local rc=0
+  sig_state "$1"; rc=$?
+  case $rc in
+    0) echo "ok-by-us" ;;
+    1) echo "unsigned" ;;
+    2) echo "by-other" ;;
+    3) echo "error" ;;
+    *) echo "?" ;;
+  esac
+}
+
+cmd_list() {
+  printf '%-24s %-30s %-12s %s\n' "PACKAGE" "BINARY" "STATE" "PATH"
+  local pkg bins
+  local -a prefixes=(); local _p
+  while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  while IFS=$'\t' read -r pkg bins || [[ -n "$pkg" ]]; do
+    [[ -z "$pkg" ]] && continue
+    local found=0 prefix cellar ver_dir bin b f s
+    for prefix in "${prefixes[@]:-}"; do
+      [[ -z "$prefix" ]] && continue
+      cellar="$prefix/Cellar/$pkg"
+      [[ -d "$cellar" ]] || continue
+      for ver_dir in "$cellar"/*/; do
+        [[ -d "$ver_dir" ]] || continue
+        found=1
+        local prov="-"
+        is_brew_installed_keg "$ver_dir" && prov="brew" || prov="nokeg"
+        if [[ -n "$bins" ]]; then
+          IFS=',' read -ra wanted <<<"$bins"
+          for b in "${wanted[@]}"; do
+            f="${ver_dir}bin/$b"
+            s=$(status_of "$f")
+            printf '%-24s %-30s %-12s %s\n' "$pkg" "$b" "$s" "$f ($prov)"
+          done
+        else
+          for bin in "${ver_dir}bin/"*; do
+            [[ -e "$bin" ]] || continue
+            is_executable_macho "$bin" || continue
+            s=$(status_of "$bin")
+            printf '%-24s %-30s %-12s %s\n' "$pkg" "$(basename "$bin")" "$s" "$bin ($prov)"
+          done
+        fi
+      done
+    done
+    (( found == 0 )) && printf '%-24s %-30s %-12s %s\n' "$pkg" "-" "absent" "(not installed)"
+  done < <(read_config)
+  return 0
+}
+
+# Returns days until cert expiry. Echoes integer; empty if cert missing or
+# unparseable. Forces LC_ALL=C so non-English locales don't change month names
+# in the openssl/date round-trip.
+cert_days_left() {
+  [[ -f "$CERT_FILE" ]] || { echo ""; return; }
+  local end_s
+  end_s=$(LC_ALL=C openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | sed 's/^notAfter=//')
+  [[ -z "$end_s" ]] && { echo ""; return; }
+  # convert "May 17 17:08:00 2036 GMT" → epoch via BSD date
+  local end_epoch
+  end_epoch=$(LC_ALL=C date -j -f "%b %d %H:%M:%S %Y %Z" "$end_s" +%s 2>/dev/null || echo 0)
+  if (( end_epoch == 0 )); then echo ""; return; fi
+  local now_s
+  now_s=$(date +%s)
+  echo $(( (end_epoch - now_s) / 86400 ))
+}
+
+cert_fingerprint() {
+  [[ -f "$CERT_FILE" ]] || return 1
+  openssl x509 -in "$CERT_FILE" -fingerprint -sha256 -noout 2>/dev/null \
+    | sed 's/^.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]'
+}
+
+cmd_status() {
+  # health status
+  local status_parts=() status="ok" agent_state="" identity_ok=0
+  if /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+       | grep -qE "\"${IDENTITY}\""; then
+    # find-identity -p codesigning only lists identities that ARE trusted,
+    # so identity_ok=1 already implies trust.
+    identity_ok=1
+  fi
+  if (( identity_ok == 0 )); then
+    status="not-set-up"
+    status_parts+=("identity '$IDENTITY' missing — run: brew-autosign setup")
+  fi
+  agent_state=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
+    | awk -F= '/state =/{sub(/^[ \t]+/,"",$2); sub(/[ \t]+$/,"",$2); print $2; exit}')
+  [[ -z "$agent_state" ]] && agent_state="not-loaded"
+  # A WatchPaths / StartInterval agent has no persistent process — it spawns
+  # only on triggers. Map launchd's "not running" to the more accurate
+  # "idle (waiting for triggers)" for the user; "running" / "waiting" are
+  # also healthy. Anything else (not-loaded, errored, etc.) is degraded.
+  case "$agent_state" in
+    "not running")
+      agent_state="idle (waiting for triggers)"
+      ;;
+    running|waiting) ;;
+    *)
+      [[ "$status" == "ok" ]] && status="degraded"
+      status_parts+=("LaunchAgent state: $agent_state")
+      ;;
+  esac
+  local days
+  days=$(cert_days_left)
+  if [[ -n "$days" ]]; then
+    if (( days < 0 )); then
+      status="degraded"
+      status_parts+=("cert EXPIRED (${days#-} days ago)")
+    elif (( days < EXPIRY_WARN_DAYS )); then
+      [[ "$status" == "ok" ]] && status="degraded"
+      status_parts+=("cert expires in $days days")
+    fi
+  fi
+  local err_tail=""
+  if [[ -s "$DATA_DIR/agent.err.log" ]]; then
+    err_tail=$(tail -n 3 "$DATA_DIR/agent.err.log")
+    if [[ -n "$err_tail" ]]; then
+      [[ "$status" == "ok" ]] && status="degraded"
+      status_parts+=("recent stderr in agent.err.log")
+    fi
+  fi
+
+  printf 'status: %s\n' "$status"
+  local m
+  for m in "${status_parts[@]:-}"; do [[ -n "$m" ]] && echo "  - $m"; done
+  echo
+  printf 'identity: %s (%s)\n' "$IDENTITY" "$([[ $identity_ok == 1 ]] && echo present || echo missing)"
+  if [[ -n "$days" ]]; then
+    printf 'cert:     %s days remaining (sha256: %s)\n' "$days" "$(cert_fingerprint || echo n/a)"
+  fi
+  printf 'agent:    %s\n' "$agent_state"
+  echo
+  hdr "watching"
+  local p any=0
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    echo "  $p"; any=1
+  done < <(watch_paths | sort -u)
+  (( any == 0 )) && echo "  (none)"
+
+  local -a unwatched=(); local _u
+  while IFS= read -r _u; do [[ -n "$_u" ]] && unwatched+=("$_u"); done < <(unwatched_packages)
+  if (( ${#unwatched[@]} > 0 )); then
+    echo
+    hdr "configured but not installed"
+    local u
+    for u in "${unwatched[@]}"; do echo "  $u"; done
+  fi
+
+  echo
+  hdr "recent log"
+  if [[ -f "$LOG" ]]; then
+    tail -n 10 "$LOG" | sed 's/^/  /'
+  else
+    echo "  (empty)"
+  fi
+  if [[ -n "$err_tail" ]]; then
+    echo
+    hdr "recent agent stderr"
+    echo "$err_tail" | sed 's/^/  /'
+  fi
+}
+
+# --- subcommand: setup ---------------------------------------------------
+
+cmd_setup() {
+  require_flock
+  command -v openssl >/dev/null || die "openssl not found"
+  [[ -x /usr/bin/security ]] || die "/usr/bin/security missing"
+  [[ -x /usr/bin/codesign ]] || die "/usr/bin/codesign missing"
+
+  echo "→ identity: $IDENTITY"
+
+  # 1. ensure cert + identity present in keychain; idempotent + resumable.
+  # `find-identity -p codesigning` only returns identities that are trusted
+  # for the codeSign policy, so identity_present == 1 already implies trust.
+  local identity_present
+  identity_present=$(/usr/bin/security find-identity -p codesigning -v 2>/dev/null | grep -qE "\"${IDENTITY}\"" && echo 1 || echo 0)
+
+  # If anything fails before we've written CERT_FILE, we want to make sure no
+  # private key material is left in any partial temp dir from a prior aborted
+  # run. Sweep stale .setup.* tmp dirs at the start of every setup.
+  find "$DATA_DIR" -maxdepth 1 -name '.setup.*' -type d -exec rm -rf {} + 2>/dev/null || true
+
+  if (( identity_present == 1 )); then
+    # if local cert file is missing (e.g. previous version cleaned it up),
+    # export the public cert from the keychain so status/expiry checks work.
+    if [[ ! -f "$CERT_FILE" ]]; then
+      local tmp_export="$CERT_FILE.tmp"
+      if /usr/bin/security find-certificate -c "$IDENTITY" -p \
+           "$HOME/Library/Keychains/login.keychain-db" >"$tmp_export" 2>/dev/null \
+         && [[ -s "$tmp_export" ]]; then
+        # Refuse to install an export that contains more than one cert; that
+        # would mean ambiguity around which identity we're operating on.
+        local pem_blocks
+        pem_blocks=$(grep -c '^-----BEGIN CERTIFICATE-----' "$tmp_export" 2>/dev/null || echo 0)
+        if (( pem_blocks > 1 )); then
+          rm -f "$tmp_export"
+          die "multiple certificates with CN='$IDENTITY' exist in the keychain; run 'brew-autosign uninstall --purge' and re-run setup to disambiguate"
+        fi
+        mv "$tmp_export" "$CERT_FILE"
+        chmod 600 "$CERT_FILE"
+        echo "→ exported public cert from keychain to $CERT_FILE"
+      else
+        rm -f "$tmp_export"
+        warn "could not export public cert from keychain; status/expiry checks will be disabled"
+      fi
+    fi
+    echo "→ identity already trusted in keychain (cert: $(cert_fingerprint || echo n/a))"
+  else
+    # generate in a private tmp dir; never leave key material in DATA_DIR.
+    # Trap on EXIT (not RETURN) so private key material is wiped even on
+    # signal-driven termination or a die() in the middle of setup.
+    local tmp
+    tmp=$(mktemp -d "$DATA_DIR/.setup.XXXXXX") || die "mktemp failed"
+    chmod 700 "$tmp"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+
+    echo "→ generating self-signed cert (ECDSA P-521 / SHA-512, 10 years)"
+    (
+      umask 077
+      openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-521 -nodes -x509 -days 3650 -sha512 \
+        -subj "/CN=$IDENTITY" \
+        -addext "keyUsage=critical,digitalSignature" \
+        -addext "extendedKeyUsage=critical,codeSigning" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -keyout "$tmp/k.key" \
+        -out "$tmp/k.crt" 2>/dev/null
+      openssl pkcs12 -export -legacy -name "$IDENTITY" \
+        -inkey "$tmp/k.key" -in "$tmp/k.crt" \
+        -out "$tmp/k.p12" -passout pass:"$IDENTITY" 2>/dev/null
+    ) || die "cert generation failed"
+
+    echo "→ importing into login keychain"
+    # -A grants any application access without a per-use prompt (required for
+    # an unattended LaunchAgent); -T is intentionally omitted because -A
+    # already dominates and `-T <path>` here would be misleading.
+    /usr/bin/security import "$tmp/k.p12" \
+      -k "$HOME/Library/Keychains/login.keychain-db" \
+      -P "$IDENTITY" -A \
+      || die "security import failed"
+
+    echo "→ trusting cert for codeSign policy (you may be prompted for your login password)"
+    /usr/bin/security add-trusted-cert -p codeSign \
+      -k "$HOME/Library/Keychains/login.keychain-db" \
+      "$tmp/k.crt" \
+      || die "security add-trusted-cert failed"
+
+    # keep ONLY the public cert (for status/fingerprint/expiry checks);
+    # discard the private key and PKCS12 — never persist them on disk.
+    cp "$tmp/k.crt" "$CERT_FILE" || die "failed to copy public cert to $CERT_FILE"
+    chmod 600 "$CERT_FILE" || die "failed to chmod $CERT_FILE"
+    rm -rf "$tmp"
+    trap - EXIT
+
+    # verify trust round-trip
+    if ! /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+         | grep -qE "\"${IDENTITY}\""; then
+      die "identity '$IDENTITY' did not become trusted after import (check Keychain Access manually)"
+    fi
+    echo "→ identity trusted; private key removed from disk"
+  fi
+
+  # 2. seed config if missing
+  if [[ ! -f "$CONFIG" ]]; then
+    local example
+    if example=$(find_example_config); then
+      cp "$example" "$CONFIG"
+      echo "→ created $CONFIG from $example"
+    else
+      cat <<'EOF' >"$CONFIG"
+# brew-autosign packages list — add one package per line, e.g.:
+#   fnox
+#   somepkg:bin1,bin2
+# then run: brew-autosign reload
+EOF
+      echo "→ created empty $CONFIG"
+    fi
+  fi
+
+  # 3. install / reload agent
+  cmd_reload
+
+  cat <<EOF
+
+✓ setup complete
+
+next:
+  1. add packages whose Keychain ACLs you want kept stable:
+       brew-autosign add fnox
+  2. first time each tool reads its secrets after this, macOS will prompt
+     "Always Allow" once per item — that binds the new stable signature.
+  3. check anytime:
+       brew-autosign status
+EOF
+}
+
+# --- subcommand: uninstall -----------------------------------------------
+
+cmd_uninstall() {
+  local purge=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --purge|-p) purge=1 ;;
+      *) die "usage: brew-autosign uninstall [--purge]" ;;
+    esac
+  done
+
+  echo "→ unloading LaunchAgent ($LABEL)"
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+
+  if (( purge == 0 )); then
+    cat <<EOF
+
+agent removed. cert and config kept at:
+  $DATA_DIR
+  $CONFIG_DIR
+
+to also remove the local code-signing identity and all data:
+  brew-autosign uninstall --purge
+EOF
+    return 0
+  fi
+
+  printf 'PURGE: this removes the local codesign identity and all data. Type "purge" to confirm: '
+  local answer
+  read -r answer
+  [[ "$answer" == "purge" ]] || { echo "aborted."; return 1; }
+
+  echo "→ removing identity from login keychain"
+  # Prefer fingerprint-based deletion (SHA-1) so we cannot collide with any
+  # other certificate that happens to share the CN. Fall back to CN match
+  # only if no local cert file was kept.
+  local fp_sha1=""
+  if [[ -f "$CERT_FILE" ]]; then
+    fp_sha1=$(LC_ALL=C openssl x509 -in "$CERT_FILE" -fingerprint -sha1 -noout 2>/dev/null \
+      | sed 's/^.*Fingerprint=//' | tr -d ':' | tr '[:lower:]' '[:upper:]')
+  fi
+  if [[ -n "$fp_sha1" ]]; then
+    /usr/bin/security delete-identity -Z "$fp_sha1" >/dev/null 2>&1 || true
+    /usr/bin/security delete-certificate -Z "$fp_sha1" >/dev/null 2>&1 || true
+  else
+    warn "no local cert file; falling back to CN-based delete (may match other certs with CN='$IDENTITY')"
+    /usr/bin/security delete-identity -c "$IDENTITY" >/dev/null 2>&1 || true
+  fi
+  echo "→ removing data and config"
+  rm -rf "$DATA_DIR" "$CONFIG_DIR"
+  echo "✓ purged. existing Keychain ACLs bound to '$IDENTITY' will prompt at next use."
+}
+
+# --- help / dispatch -----------------------------------------------------
+
+cmd_help() {
+  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+usage_for() {
+  case "$1" in
+    add)         echo "usage: brew-autosign add <pkg>[:bin1,bin2,...]" ;;
+    remove)      echo "usage: brew-autosign remove <pkg>" ;;
+    uninstall)   echo "usage: brew-autosign uninstall [--purge]" ;;
+    completions) echo "usage: brew-autosign completions <install|uninstall|generate> <zsh|bash|fish|auto>" ;;
+    *)           cmd_help ;;
+  esac
+}
+
+# --- subcommand: completions ---------------------------------------------
+
+COMPLETION_MARKER='# brew-autosign:generated-completion'
+
+# Canonical user-level install paths (codex-vetted).
+completion_path() {
+  case "$1" in
+    zsh)  echo "${ZDOTDIR:-$HOME}/.zsh/completions/_brew-autosign" ;;
+    bash) echo "$HOME/.bash_completion.d/brew-autosign" ;;
+    fish) echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/brew-autosign.fish" ;;
+    *)    die "unsupported shell '$1'" ;;
+  esac
+}
+
+resolve_shell() {
+  local req=$1
+  if [[ "$req" == auto ]]; then
+    local sh
+    sh=$(basename "${SHELL:-}")
+    case "$sh" in
+      zsh|bash|fish) echo "$sh" ;;
+      *) die "could not auto-detect shell from \$SHELL='${SHELL:-}'; pass zsh|bash|fish explicitly" ;;
+    esac
+  else
+    case "$req" in
+      zsh|bash|fish) echo "$req" ;;
+      *) die "unsupported shell '$req'; use zsh, bash, fish, or auto" ;;
+    esac
+  fi
+}
+
+gen_completion_zsh() {
+  cat <<'EOF'
+#compdef brew-autosign
+# brew-autosign:generated-completion
+_brew_autosign() {
+  local -a _ba_subcmds
+  _ba_subcmds=(
+    'setup:one-time setup (cert + agent)'
+    'sign:run a sign pass'
+    'reload:regenerate plist + reload agent'
+    'add:add a package'
+    'remove:remove a package'
+    'list:per-binary signing state'
+    'status:health summary'
+    'uninstall:remove LaunchAgent (or --purge)'
+    'completions:manage shell completions'
+    'help:show help'
+  )
+  local state
+  _arguments -C '1: :->subcmd' '*::arg:->args'
+  case "$state" in
+    subcmd) _describe 'subcommand' _ba_subcmds ;;
+    args)
+      case "${words[1]}" in
+        add)         _arguments '1: :_ba_formulae' '--help' ;;
+        remove)      _arguments '1: :_ba_pkgs' '--help' ;;
+        uninstall)   _arguments '--purge' '--help' ;;
+        completions) _arguments \
+                       '1: :(install uninstall generate)' \
+                       '2: :(zsh bash fish auto)' '--help' ;;
+        *) _arguments '--help' ;;
+      esac
+      ;;
+  esac
+}
+_ba_formulae() {
+  local -a f
+  f=(${(f)"$(brew list --formula 2>/dev/null)"})
+  _describe 'formula' f
+}
+_ba_pkgs() {
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/brew-autosign/packages.conf"
+  [[ -f "$cfg" ]] || return
+  local -a p
+  p=(${(f)"$(awk -F'[:[:space:]]' '/^[a-z0-9]/ {print $1}' "$cfg")"})
+  _describe 'package' p
+}
+_brew_autosign "$@"
+EOF
+}
+
+gen_completion_bash() {
+  cat <<'EOF'
+# brew-autosign:generated-completion
+_brew_autosign() {
+  local cur prev cmd
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]:-}"
+  cmd="${COMP_WORDS[1]:-}"
+
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "setup sign reload add remove list status uninstall completions help" -- "$cur") )
+    return
+  fi
+
+  case "$cmd" in
+    add)
+      local f
+      f=$(brew list --formula 2>/dev/null)
+      COMPREPLY=( $(compgen -W "$f --help" -- "$cur") )
+      ;;
+    remove)
+      local cfg p
+      cfg="${XDG_CONFIG_HOME:-$HOME/.config}/brew-autosign/packages.conf"
+      [[ -f "$cfg" ]] && p=$(awk -F'[:[:space:]]' '/^[a-z0-9]/ {print $1}' "$cfg")
+      COMPREPLY=( $(compgen -W "$p --help" -- "$cur") )
+      ;;
+    uninstall)
+      COMPREPLY=( $(compgen -W "--purge --help" -- "$cur") )
+      ;;
+    completions)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "install uninstall generate --help" -- "$cur") )
+      elif [[ $COMP_CWORD -eq 3 ]]; then
+        COMPREPLY=( $(compgen -W "zsh bash fish auto" -- "$cur") )
+      fi
+      ;;
+    *)
+      COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+      ;;
+  esac
+}
+complete -F _brew_autosign brew-autosign
+EOF
+}
+
+gen_completion_fish() {
+  cat <<'EOF'
+# brew-autosign:generated-completion
+function __brew_autosign_packages
+  set -l cfg "$XDG_CONFIG_HOME/brew-autosign/packages.conf"
+  test -z "$XDG_CONFIG_HOME"; and set cfg "$HOME/.config/brew-autosign/packages.conf"
+  test -f "$cfg"; or return
+  awk -F'[:[:space:]]' '/^[a-z0-9]/ {print $1}' "$cfg"
+end
+
+function __brew_autosign_formulae
+  brew list --formula 2>/dev/null
+end
+
+set -l no_sub 'not __fish_seen_subcommand_from setup sign reload add remove list status uninstall completions help'
+
+complete -c brew-autosign -f
+complete -c brew-autosign -n "$no_sub" -a setup       -d 'one-time setup'
+complete -c brew-autosign -n "$no_sub" -a sign        -d 'run a sign pass'
+complete -c brew-autosign -n "$no_sub" -a reload      -d 'reload agent'
+complete -c brew-autosign -n "$no_sub" -a add         -d 'add a package'
+complete -c brew-autosign -n "$no_sub" -a remove      -d 'remove a package'
+complete -c brew-autosign -n "$no_sub" -a list        -d 'signing state'
+complete -c brew-autosign -n "$no_sub" -a status      -d 'health summary'
+complete -c brew-autosign -n "$no_sub" -a uninstall   -d 'remove agent'
+complete -c brew-autosign -n "$no_sub" -a completions -d 'manage completions'
+complete -c brew-autosign -n "$no_sub" -a help        -d 'show help'
+
+complete -c brew-autosign -n '__fish_seen_subcommand_from add'    -a '(__brew_autosign_formulae)'
+complete -c brew-autosign -n '__fish_seen_subcommand_from remove' -a '(__brew_autosign_packages)'
+complete -c brew-autosign -n '__fish_seen_subcommand_from uninstall' -l purge -d 'also remove cert + config'
+complete -c brew-autosign \
+  -n '__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from install uninstall generate' \
+  -a 'install uninstall generate'
+complete -c brew-autosign \
+  -n '__fish_seen_subcommand_from install uninstall generate' \
+  -a 'zsh bash fish auto'
+EOF
+}
+
+# rc-file / fpath / etc. advice printed after a successful install
+post_install_advice() {
+  local shell=$1 path=$2
+  case "$shell" in
+    zsh)
+      cat <<EOF
+add to your ~/.zshrc BEFORE \`compinit\`:
+  fpath=(${ZDOTDIR:-\$HOME}/.zsh/completions \$fpath)
+then restart your shell, or run:
+  rm -f \$HOME/.zcompdump* && compinit
+EOF
+      local brew_pfx
+      brew_pfx=$(brew --prefix brew-autosign 2>/dev/null || true)
+      if [[ -n "$brew_pfx" && -f "$brew_pfx/share/zsh/site-functions/_brew-autosign" ]]; then
+        echo "note: Homebrew also ships completions at \$brew_pfx/share/zsh/site-functions/. The user-level file installed above wins if \$fpath lists ~/.zsh/completions first."
+      fi
+      ;;
+    bash)
+      cat <<EOF
+add to your ~/.bash_profile or ~/.bashrc:
+  [[ -f $path ]] && source $path
+then restart your shell, or:
+  source $path
+EOF
+      ;;
+    fish)
+      echo "fish auto-discovers completions on next shell start; nothing else to do."
+      ;;
+  esac
+}
+
+cmd_completions() {
+  local action="${1:-}" shell_arg="${2:-}"
+  [[ -n "$action" && -n "$shell_arg" ]] || die "usage: brew-autosign completions <install|uninstall|generate> <zsh|bash|fish|auto>"
+  case "$action" in
+    install|uninstall|generate) ;;
+    *) die "unknown completions action '$action'; use install, uninstall, or generate" ;;
+  esac
+  local shell
+  shell=$(resolve_shell "$shell_arg") || return $?
+
+  case "$action" in
+    generate)
+      "gen_completion_$shell"
+      ;;
+    install)
+      local path content existing
+      path=$(completion_path "$shell")
+      content=$("gen_completion_$shell")
+      mkdir -p "$(dirname "$path")"
+      if [[ -f "$path" ]]; then
+        if grep -qF "$COMPLETION_MARKER" "$path"; then
+          existing=$(cat "$path")
+          if [[ "$content" == "$existing" ]]; then
+            echo "already up to date: $path"
+            post_install_advice "$shell" "$path"
+            return 0
+          fi
+          printf '%s\n' "$content" >"$path"
+          echo "updated: $path"
+        else
+          die "refusing to overwrite $path: not created by brew-autosign (no marker). Remove or rename it first."
+        fi
+      else
+        printf '%s\n' "$content" >"$path"
+        echo "installed: $path"
+      fi
+      post_install_advice "$shell" "$path"
+      ;;
+    uninstall)
+      local path
+      path=$(completion_path "$shell")
+      if [[ ! -f "$path" ]]; then
+        echo "not installed: $path"
+        return 0
+      fi
+      if grep -qF "$COMPLETION_MARKER" "$path"; then
+        rm -f "$path" && echo "removed: $path"
+      else
+        die "refusing to delete $path: not created by brew-autosign (no marker)."
+      fi
+      ;;
+  esac
+}
+
+# subcommand-level --help
+maybe_subcommand_help() {
+  local sub=$1; shift
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -h|--help) usage_for "$sub"; exit 0 ;;
+    esac
+  done
+}
+
+case "${1:-help}" in
+  setup)       shift; maybe_subcommand_help setup "$@"; cmd_setup ;;
+  sign)        shift; maybe_subcommand_help sign "$@"; cmd_sign ;;
+  reload)      shift; maybe_subcommand_help reload "$@"; cmd_reload ;;
+  add)         shift; maybe_subcommand_help add "$@"; cmd_add "$@" ;;
+  remove)      shift; maybe_subcommand_help remove "$@"; cmd_remove "$@" ;;
+  list)        shift; maybe_subcommand_help list "$@"; cmd_list ;;
+  status)      shift; maybe_subcommand_help status "$@"; cmd_status ;;
+  uninstall)   shift; maybe_subcommand_help uninstall "$@"; cmd_uninstall "$@" ;;
+  completions) shift; maybe_subcommand_help completions "$@"; cmd_completions "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) cmd_help >&2; exit 1 ;;
+esac
