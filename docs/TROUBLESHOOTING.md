@@ -38,9 +38,46 @@ The single command that answers "is everything working?" is `brew-autosign statu
      cat ~/.local/share/brew-autosign/agent.err.log
      ```
 
-3. If the binary **is** signed correctly but Keychain still prompts, the ACL on those pre-existing items still references the **old** designated requirement (an unsigned-binary hash or a different identity). Click "Always Allow" on each prompt; the ACL will be updated to trust the new stable identity. Future upgrades will be silent.
+3. If the binary **is** signed correctly but Keychain still prompts, the ACL on those pre-existing items still references the **old** designated requirement (an unsigned-binary hash or a different identity). Click "Always Allow" on each prompt; the ACL will be updated to trust the new stable identity. Future upgrades will be silent for **that secret**. See the next section if you find yourself re-prompted later for *different* secrets.
 
    ![macOS Keychain prompt — choose "Always Allow"](images/SCR-20260517-rtqv-2.png)
+
+## Symptom: I clicked "Always Allow" yesterday and I'm being prompted again today
+
+This is **expected** Keychain behavior, not a bug in `brew-autosign`. Keychain ACLs are **per-secret**, not per-binary. "Always Allow" binds the new signature only to the **specific item** that the prompt was for — every other secret still carries its old ACL until it is read and re-authorized.
+
+If your tool stores many secrets (e.g. `fnox` users commonly have 20+ items with `svce=fnox`), the prompts trickle out over days as you happen to touch each one for the first time post-signing. Once a secret has been "Always Allow"'d, it stays silent across all future `brew upgrade` cycles.
+
+To confirm the signing itself is stable (i.e. the designated requirement is the same as it was at the last "Always Allow"):
+
+```sh
+codesign -d --requirements - /usr/local/bin/<tool>
+```
+
+Expect:
+
+```
+designated => identifier <tool> and certificate leaf = H"<40-char-sha1>"
+```
+
+That `H"..."` is the SHA-1 fingerprint of your local cert. Cross-check:
+
+```sh
+openssl x509 -in ~/.local/share/brew-autosign/codesign.crt -fingerprint -sha1 -noout
+```
+
+If both fingerprints match, your designated requirement has not changed since previous signings — every prompt you see is for a secret whose ACL was set before this identity existed (or before your last `setup`). Click "Always Allow" once and that secret will be silent forever.
+
+If the fingerprints **do not** match, your local cert was regenerated (e.g. someone re-ran `brew-autosign setup` after `uninstall --purge`) and every previously-allowed ACL is now obsolete. There is no recovery short of re-clicking "Always Allow" on each secret once more.
+
+You can also reproduce the stable-DR check without waiting for a real upgrade:
+
+```sh
+brew reinstall <pkg>     # fresh binary at the same path
+codesign -d --requirements - /usr/local/bin/<pkg>
+```
+
+The DR after reinstall must be byte-identical to the DR before reinstall. If it is, no further Always-Allow prompts should appear for already-authorized secrets.
 
 ## Symptom: `setup` says "MAC verification failed during PKCS12 import"
 
