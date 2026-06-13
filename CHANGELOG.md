@@ -2,6 +2,23 @@
 
 All notable changes to brew-autosign. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Configurable signing identity with auto-detection.** New `identity` subcommand (`show` / `list` / `set <name|sha1>` / `reset`) lets you sign with any codesigning identity in your login keychain — e.g. an Apple Development or Developer ID cert — instead of the managed self-signed default. Identities are auto-detected; the choice is stored in `~/.config/brew-autosign/identity`. `identity set` validates the identity, re-signs configured binaries with it, and reloads the agent. Nothing identity-specific is hardcoded.
+- **`sign --force`** re-signs configured binaries even when already signed by another identity (used by `identity set` to apply a switch immediately). The automatic agent pass keeps its safe never-overwrite default.
+- `status` now reports the active identity and its source (managed vs configured), and reads expiry for external certs from the keychain (30-day warning window; 365 days for the managed 10-year cert).
+
+### Changed
+
+- **More reliable triggering.** The LaunchAgent now also watches each prefix's long-lived `opt/` directory (retargeted on every `brew upgrade`), which survives the atomic delete+recreate of a per-package symlink that can orphan a vnode watch, and auto-covers configured-but-not-yet-installed packages without a manual `reload`. The periodic backstop tightened from 60 to 30 minutes.
+- `sig_state` matches the signer by fixed-string comparison (not regex), so identities containing metacharacters — e.g. `Apple Development: name (TEAMID)` — are recognized correctly.
+
+### Fixed
+
+- Keychain ACLs no longer silently break when a second codesigning identity (e.g. a newly added Apple Developer cert) is present and a configured tool drifts between identities across upgrades. Standardize on one identity via `brew-autosign identity set`; see `docs/TROUBLESHOOTING.md`.
+
 ## [0.1.0] — 2026-05-17
 
 Initial release.

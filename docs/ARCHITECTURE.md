@@ -24,6 +24,8 @@ If a binary is **signed by a stable identity**, its DR references that identity 
 2. A LaunchAgent (`dev.brew-autosign`) watches `Cellar/<pkg>` for each configured package. On any change there (i.e. a brew upgrade has just deposited a new version subdirectory), the agent runs `codesign --force --sign brew-autosign-local <binary>` on the freshly-installed binary.
 3. The DR of the new binary now reads "signed by brew-autosign-local", which is identical to the DR of the previous version, which is what the Keychain ACL already trusts. No prompt.
 
+The signing identity is **configurable**. By default it is the managed `brew-autosign-local` cert above, but `brew-autosign identity set` can point the agent at any codesigning identity in the login keychain (e.g. an Apple Development or Developer ID cert). For Apple-issued certs the DR matches by `anchor apple generic and certificate leaf[subject.CN] = "..."` rather than a fixed leaf hash, which typically survives the cert's annual renewal as long as the common name is unchanged. The choice lives in `~/.config/brew-autosign/identity`; nothing identity-specific is hardcoded. An external identity's private key must permit non-interactive `codesign` access for the unattended agent to use it.
+
 ## Why a LaunchAgent (and not alternatives)
 
 This was the most-considered design question. Other paths were rejected for the following reasons.
@@ -53,9 +55,9 @@ Homebrew exposes `post_install` per-formula but **no global post-install hook**.
 
 Trade-offs:
 
-- `WatchPaths` is **not recursive**: launchd watches the listed path itself for `vnode` change events, not its descendants. For our use case this is sufficient because brew creates and removes subdirectories of `Cellar/<pkg>` (one per version), which constitutes a modification of `Cellar/<pkg>` itself. We also include `<prefix>/opt/<pkg>` as a redundant trigger (it's a symlink that brew points at the active version).
+- `WatchPaths` is **not recursive**: launchd watches the listed path itself for `vnode` change events, not its descendants. For our use case this is sufficient because brew creates and removes subdirectories of `Cellar/<pkg>` (one per version), which constitutes a modification of `Cellar/<pkg>` itself. We also include `<prefix>/opt/<pkg>` as a redundant trigger (it's a symlink that brew points at the active version), and — crucially — the long-lived `<prefix>/opt` **directory** itself. brew retargets the `opt/<pkg>` symlink at the end of every `brew upgrade`/install, which modifies the `opt` directory; watching the directory therefore fires reliably even when an individual symlink's watch is orphaned by an atomic delete+recreate (a known way for a vnode watch to silently stop firing), and it auto-covers configured-but-not-yet-installed packages.
 - `WatchPaths` may coalesce or drop events under heavy churn; `RunAtLoad=true` ensures correctness at agent load time, and the script is idempotent so duplicate triggers are harmless.
-- The watched paths must exist at agent-load time. If a package is added to `packages.conf` for a tool that's not yet installed, `brew-autosign reload` simply omits its path from `WatchPaths` until the package exists. Re-run `reload` after the first install.
+- The per-package watched paths must exist at agent-load time. If a package is added to `packages.conf` for a tool that's not yet installed, `brew-autosign reload` omits its `Cellar/<pkg>` path from `WatchPaths` until the package exists — but the broad `<prefix>/opt` directory watch still catches the first install, so signing happens without a manual `reload` (run `reload` anyway if you want the targeted path back).
 
 ## Why only unsigned binaries are touched
 
@@ -89,6 +91,7 @@ This pain happens **once** for items created before `brew-autosign` was installe
 ```
 ~/.local/bin/brew-autosign            # the CLI (sign, reload, add, ...)
 ~/.config/brew-autosign/packages.conf # user-editable package list
+~/.config/brew-autosign/identity      # optional: override signing identity (CN/sha1)
 ~/.local/share/brew-autosign/         # mode 700
     codesign.crt                      # PUBLIC cert only (key + p12 are removed after import)
     log.txt                           # signing log
@@ -172,9 +175,9 @@ Multiple WatchPaths events can fire in quick succession (each subdirectory creat
 
 ## Backstop against WatchPaths drops
 
-`launchd.plist(5)` notes that `WatchPaths` events can be coalesced or dropped under load. The plist therefore also sets `StartInterval` to 3600 seconds, causing an idempotent sign pass to run hourly regardless of WatchPaths activity. The pass is a no-op when nothing changed; when an upgrade was missed, it converges within at most an hour.
+`launchd.plist(5)` notes that `WatchPaths` events can be coalesced or dropped under load. The plist therefore also sets `StartInterval` to 1800 seconds, causing an idempotent sign pass to run every 30 minutes regardless of WatchPaths activity. The pass is a no-op when nothing changed; when an upgrade was missed, it converges within at most half an hour. This is deep insurance — the broad `<prefix>/opt` directory watch already makes a missed upgrade unlikely.
 
-`LegacyTimers` is **not** set. Apple's default since macOS 10.13 is to coalesce wake-from-sleep timers across all daemons into a few wake events per hour to minimise battery impact. We accept that default deliberately — the agent does not require precise hourly firing, only "approximately hourly", and we prefer the battery-friendly behaviour. Setting `LegacyTimers=true` would force a precise wake every 3600 s, which is unnecessary for our use case.
+`LegacyTimers` is **not** set. Apple's default since macOS 10.13 is to coalesce wake-from-sleep timers across all daemons into a few wake events per hour to minimise battery impact. We accept that default deliberately — the agent does not require precise firing, only "approximately every 30 minutes", and we prefer the battery-friendly behaviour. Setting `LegacyTimers=true` would force a precise wake every 1800 s, which is unnecessary for our use case.
 
 ## What if I want to know what was signed?
 
@@ -201,4 +204,4 @@ XML values in the generated LaunchAgent plist are escaped (`&`, `<`, `>`, `"`, `
 - **Shared `Cellar` across multiple user accounts** is not supported: each user's keychain holds a different identity, so binaries signed by user A appear as "signed-by-other" to user B, and B's ACLs will not match. Either pick one user as the signer or have each user accept independent ACL re-binds.
 - **Pre-existing Keychain items** created before install have ACLs anchored to the old (unsigned-binary or different-identity) DR. First post-install access prompts "Always Allow" once per item — this is unavoidable without privileged ACL rewrite, which macOS does not expose.
 - **Only `bin/<...>` is signed.** Binaries living in `sbin/`, `libexec/`, or further nested dirs need explicit `pkg:relative/path` support, which is not implemented yet.
-- **Cert expiry at 10 years.** `status` warns when fewer than 365 days remain. Rotation is manual: `brew-autosign uninstall --purge && brew-autosign setup`; this forces the one-time "Always Allow" cycle again.
+- **Cert expiry at 10 years** (managed identity). `status` warns when fewer than 365 days remain. Rotation is manual: `brew-autosign uninstall --purge && brew-autosign setup`; this forces the one-time "Always Allow" cycle again. For an external identity (Apple Development / Developer ID) the warning window is 30 days; renew through your Apple workflow then `brew-autosign sign --force` — a renewal that preserves the cert's common name needs no re-authorization.

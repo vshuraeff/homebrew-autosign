@@ -14,7 +14,8 @@ Many Homebrew bottles ship **unsigned** (e.g. [`fnox`](https://fnox.jdx.dev/), `
 
 Key properties:
 
-- **Zero workflow change.** Triggers on both `brew upgrade <pkg>` and bulk `brew upgrade`. Nothing to remember after install. An hourly backstop catches anything WatchPaths might miss.
+- **Zero workflow change.** Triggers on both `brew upgrade <pkg>` and bulk `brew upgrade`. Nothing to remember after install. A periodic backstop (every 30 min) plus a broad watch on each prefix's `opt/` directory catch anything a per-package WatchPath might miss.
+- **Configurable identity.** Signs with a managed self-signed cert by default, but can use **any** codesigning identity in your keychain — e.g. an Apple Development or Developer ID cert — via `brew-autosign identity`. Available identities are auto-detected; nothing is hardcoded.
 - **Survives Homebrew self-updates** (LaunchAgent does not depend on brew's machinery).
 - **Survives upstream formula changes** (no local tap to keep in sync).
 - **Safe by default.** Only **currently unsigned** Mach-O binaries are signed. Binaries already signed by someone else (Apple, the vendor) are never touched. Codesign errors are surfaced, never silently confused with "signed by other".
@@ -51,6 +52,11 @@ brew-autosign status               # health summary + agent state + expiry + log
 brew-autosign remove fnox          # stop auto-signing
 brew-autosign reload               # regenerate plist after editing config by hand
 brew-autosign sign                 # run a sign pass now (non-zero exit on failures)
+brew-autosign sign --force         # re-sign configured binaries even if already signed
+brew-autosign identity             # show active signing identity + auto-detect others
+brew-autosign identity list        # list codesigning identities found in your keychain
+brew-autosign identity set <name>  # sign with a specific identity (e.g. your Apple Dev cert)
+brew-autosign identity reset       # revert to the managed self-signed identity
 brew-autosign uninstall            # remove the agent (keeps cert/config)
 brew-autosign uninstall --purge    # also delete cert + Keychain identity
 ```
@@ -82,11 +88,32 @@ Fields:
 
 See [`share/packages.conf.example`](share/packages.conf.example) for the annotated template `setup` installs.
 
+## Signing identity
+
+By default `brew-autosign` signs with a **managed self-signed certificate** (`CN=brew-autosign-local`, 10-year ECDSA P-521) that `setup` generates in your login keychain. Its designated requirement is `identifier "<tool>" and certificate leaf = H"<sha1>"` — stable for a decade, so Keychain ACLs survive every `brew upgrade`.
+
+If you already have a codesigning identity you'd rather use — an **Apple Development** or **Developer ID Application** cert, for example — point brew-autosign at it:
+
+```sh
+brew-autosign identity list                                   # auto-detect what's in your keychain
+brew-autosign identity set "Apple Development: you@example.com (TEAMID)"
+brew-autosign identity reset                                  # back to the managed self-signed cert
+```
+
+`identity set` stores your choice in `~/.config/brew-autosign/identity`, re-signs all configured binaries with the new identity, and reloads the agent. It accepts either the full common name or the cert's SHA-1 hash, and resolves a unique substring too.
+
+Trade-offs:
+
+- **Managed self-signed (default):** zero setup, 10-year stability, no Apple account needed. Only meaningful locally (not notarizable).
+- **Apple Development / Developer ID:** chains to Apple, but these certs expire (~1 year for Development). The DR matches by the cert's **common name**, so it usually survives renewal — but if the CN ever changes you re-authorize secrets once. The agent signs unattended, so that identity's private key must allow non-interactive `codesign` access (Keychain Access → key → Access Control). `brew-autosign status` shows the active identity and warns 30 days before an external cert expires.
+
+> Switching identities (in either direction) changes the designated requirement, so macOS re-prompts **"Always Allow"** once per Keychain secret the first time each is read under the new signature — the same one-time onboarding as a fresh install.
+
 ## How it works
 
-1. A self-signed ECDSA P-521 cert (`CN=brew-autosign-local`, `codeSigning` EKU, SHA-512, 10 years) lives in your login keychain. ~256-bit security level — the strongest NIST curve Apple `codesign` accepts.
-2. A LaunchAgent (`~/Library/LaunchAgents/dev.brew-autosign.plist`) is configured with `WatchPaths` covering each configured package's `Cellar/<pkg>` directory.
-3. On any change inside those directories (brew upgrades create a new `Cellar/<pkg>/<new-version>/` subdirectory), launchd fires the agent.
+1. A self-signed ECDSA P-521 cert (`CN=brew-autosign-local`, `codeSigning` EKU, SHA-512, 10 years) lives in your login keychain. ~256-bit security level — the strongest NIST curve Apple `codesign` accepts. (Or any codesigning identity you select with `brew-autosign identity` — see [Signing identity](#signing-identity).)
+2. A LaunchAgent (`~/Library/LaunchAgents/dev.brew-autosign.plist`) is configured with `WatchPaths` covering each configured package's `Cellar/<pkg>` directory, **plus** a broad watch on each prefix's long-lived `opt/` directory (retargeted on every `brew upgrade`, so it fires even when a per-package symlink's watch goes stale), **plus** a 30-minute periodic backstop.
+3. On any change inside those directories (brew upgrades create a new `Cellar/<pkg>/<new-version>/` subdirectory and retarget `opt/<pkg>`), launchd fires the agent.
 4. The agent's `sign` pass walks each configured package, locates currently-unsigned Mach-O binaries, and re-signs them with the stable identity using `codesign --force --sign`.
 
 Because the cert is fixed and the binary's designated requirement therefore stays the same, macOS Keychain ACLs remain valid no matter how many times brew swaps the binary.

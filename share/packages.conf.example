@@ -27,11 +27,22 @@
 #   <binary>    — the file name inside the package's bin/ directory.
 #
 # ─── Safety ───────────────────────────────────────────────────────────────
-# brew-autosign never overwrites an existing signature. Each binary is
-# classified as:
+# The automatic agent pass never overwrites an existing signature. Each binary
+# is classified as:
 #   - signed by us           → skipped (idempotent)
 #   - signed by someone else → skipped (Apple / vendor signature preserved)
-#   - not signed at all      → signed with the local identity
+#   - not signed at all      → signed with the active identity
+# (An explicit `brew-autosign sign --force` re-signs configured binaries even if
+# already signed — used when switching identities. It only touches packages
+# listed here, never arbitrary files.)
+#
+# ─── Signing identity ──────────────────────────────────────────────────────
+# Packages here are signed with brew-autosign's active identity — a managed
+# self-signed cert by default. To sign with your own Apple Development /
+# Developer ID cert instead (auto-detected from your keychain):
+#   brew-autosign identity list
+#   brew-autosign identity set <name>
+# The identity lives separately in ~/.config/brew-autosign/identity.
 #
 # ─── After editing ────────────────────────────────────────────────────────
 # Run:

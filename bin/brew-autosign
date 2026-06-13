@@ -10,6 +10,7 @@
 #   remove <pkg>    remove <pkg> from packages.conf and reload
 #   list            show configured packages and their current signing status
 #   status          health summary, agent state, watched paths, recent log
+#   identity        show/list/set/reset the signing identity (auto-detected)
 #   uninstall       unload and remove the LaunchAgent (use --purge to also remove cert + config)
 #   completions <install|uninstall|generate> <zsh|bash|fish|auto>
 #                   manage shell tab-completion
@@ -25,10 +26,16 @@ umask 077
 
 # --- constants -----------------------------------------------------------
 
+# IDENTITY: the self-signed code-signing identity that `setup` generates and
+# manages. Generic and identical for every user — the zero-config default. The
+# EFFECTIVE signing identity (SIGN_IDENTITY) can be overridden per-user via the
+# `identity` config file (e.g. to use an "Apple Development: ..." or
+# "Developer ID Application: ..." cert). Nothing user-specific is hardcoded.
 IDENTITY="brew-autosign-local"
 LABEL="dev.brew-autosign"
 CONFIG_DIR="$HOME/.config/brew-autosign"
 CONFIG="$CONFIG_DIR/packages.conf"
+IDENTITY_CONFIG="$CONFIG_DIR/identity"   # optional signing-identity override
 DATA_DIR="$HOME/.local/share/brew-autosign"
 LOG="$DATA_DIR/log.txt"
 SIGN_LOCK="$DATA_DIR/.sign.lock"
@@ -39,10 +46,15 @@ PLIST="$HOME/Library/LaunchAgents/dev.brew-autosign.plist"
 
 DEBOUNCE_SECONDS=2
 LOG_MAX_BYTES=1048576
-BACKSTOP_INTERVAL_SECONDS=3600   # hourly periodic sign pass as WatchPaths backstop
+BACKSTOP_INTERVAL_SECONDS=1800   # periodic sign pass (30 min) as WatchPaths backstop
 STABILITY_MAX_TRIES=10
 STABILITY_SLEEP_SECONDS=0.2
-EXPIRY_WARN_DAYS=365
+EXPIRY_WARN_DAYS=365            # warn window for the managed 10-year self-signed cert
+EXPIRY_WARN_DAYS_EXTERNAL=30    # warn window for short-lived external certs (Apple Dev etc.)
+
+# runtime flag: set by `sign --force` / `identity set` to overwrite an existing
+# non-target signature on configured binaries. 0 = safe default (never clobber).
+FORCE_RESIGN=0
 
 # brew formula name format per Homebrew core: leading [a-z0-9], then
 # [a-z0-9._+@-]. We accept the same set; reject everything else.
@@ -202,6 +214,67 @@ trim() {
   printf '%s' "$s"
 }
 
+# --- signing identity resolution -----------------------------------------
+
+# List codesigning identities as TAB-separated "<sha1>\t<common-name>" lines.
+list_codesign_identities() {
+  /usr/bin/security find-identity -p codesigning -v 2>/dev/null | while IFS= read -r line; do
+    # lines look like:  '  1) <SHA1> "<common name>"'
+    if [[ "$line" =~ ^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-Fa-f]+)[[:space:]]+\"(.*)\"[[:space:]]*$ ]]; then
+      printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    fi
+  done
+}
+
+# Resolve a user-supplied identity reference (SHA-1 hash, exact common name, or
+# unique CN substring) to the canonical common name as it appears in the
+# keychain. Echoes the CN; rc 0 = resolved, 1 = no match, 2 = ambiguous. We
+# resolve to the CN because that is what `codesign -dv` prints as `Authority=`,
+# which is how we recognize our own signatures.
+canonicalize_identity() {
+  local want=$1 sha cn matches=0 found=""
+  while IFS=$'\t' read -r sha cn; do
+    [[ -z "$cn" ]] && continue
+    if [[ "$want" == "$sha" || "$want" == "$cn" ]]; then
+      printf '%s' "$cn"; return 0   # exact hash / CN match wins immediately
+    fi
+    if [[ "$cn" == *"$want"* ]]; then
+      matches=$((matches+1)); found="$cn"
+    fi
+  done < <(list_codesign_identities)
+  if (( matches == 1 )); then printf '%s' "$found"; return 0; fi
+  (( matches > 1 )) && return 2
+  return 1
+}
+
+# Effective signing identity:
+#   1. if $IDENTITY_CONFIG holds a value, canonicalize and use it;
+#   2. otherwise fall back to the managed self-signed $IDENTITY.
+resolve_sign_identity() {
+  local raw="" canon
+  if [[ -f "$IDENTITY_CONFIG" ]]; then
+    raw=$(grep -vE '^[[:space:]]*(#|$)' "$IDENTITY_CONFIG" 2>/dev/null | head -1)
+    raw=$(trim "$raw")
+  fi
+  if [[ -z "$raw" ]]; then printf '%s' "$IDENTITY"; return 0; fi
+  if canon=$(canonicalize_identity "$raw"); then
+    printf '%s' "$canon"
+  else
+    # configured identity not resolvable right now (cert not imported yet);
+    # use the raw value so signing still targets it and status can flag it.
+    printf '%s' "$raw"
+  fi
+}
+
+# recompute SIGN_IDENTITY + IDENTITY_IS_MANAGED (called at startup and after the
+# `identity` subcommand mutates the override).
+refresh_sign_identity() {
+  SIGN_IDENTITY=$(resolve_sign_identity)
+  IDENTITY_IS_MANAGED=0
+  [[ "$SIGN_IDENTITY" == "$IDENTITY" ]] && IDENTITY_IS_MANAGED=1
+}
+refresh_sign_identity
+
 # --- config helpers ------------------------------------------------------
 
 # yields tab-separated lines: <pkg>\t<bin1,bin2,...>   (binaries column may be empty).
@@ -254,14 +327,31 @@ watch_paths() {
   local pkg _ prefix
   local -a prefixes=(); local _p
   while IFS= read -r _p; do [[ -n "$_p" ]] && prefixes+=("$_p"); done < <(homebrew_prefixes)
+  local has_pkg=0
   while IFS=$'\t' read -r pkg _ || [[ -n "$pkg" ]]; do
     [[ -z "$pkg" ]] && continue
+    has_pkg=1
     for prefix in "${prefixes[@]:-}"; do
       [[ -z "$prefix" ]] && continue
+      # targeted: Cellar/<pkg> mtime changes when a version dir is added/removed
       [[ -d "$prefix/Cellar/$pkg" ]] && echo "$prefix/Cellar/$pkg"
+      # targeted: opt/<pkg> symlink is retargeted at the end of `brew link`,
+      # firing once the new binary is fully written and stable.
       [[ -L "$prefix/opt/$pkg" || -d "$prefix/opt/$pkg" ]] && echo "$prefix/opt/$pkg"
     done
   done < <(read_config)
+  # broad backstop watch: <prefix>/opt is a long-lived directory whose mtime
+  # changes on every `brew upgrade`/install (opt symlinks get retargeted). It
+  # survives the atomic delete+recreate of a per-package symlink — which can
+  # orphan a vnode-based watch and silently stop firing — and auto-covers
+  # configured-but-not-yet-installed packages without a manual `reload`. Gated
+  # on a non-empty config so an empty packages.conf yields no watches at all.
+  if (( has_pkg )); then
+    for prefix in "${prefixes[@]:-}"; do
+      [[ -z "$prefix" ]] && continue
+      [[ -d "$prefix/opt" ]] && echo "$prefix/opt"
+    done
+  fi
   return 0
 }
 
@@ -343,20 +433,22 @@ wait_for_stable_file() {
 
 # 0 = signed by us, 1 = unsigned, 2 = signed by someone else, 3 = codesign error
 sig_state() {
-  local out rc
+  local out rc auth
   out=$(/usr/bin/codesign -dv --verbose=2 "$1" 2>&1)
   rc=$?
-  if echo "$out" | grep -q '^Authority='; then
-    if echo "$out" | grep -qE "^Authority=${IDENTITY}\$"; then
-      return 0
-    fi
+  # first Authority line is the leaf signer. Compare as a FIXED string (not a
+  # regex) so identities with metacharacters — e.g. "Apple Development: name
+  # (TEAMID)" — match correctly.
+  auth=$(printf '%s\n' "$out" | sed -n 's/^Authority=//p' | head -1)
+  if [[ -n "$auth" ]]; then
+    [[ "$auth" == "$SIGN_IDENTITY" ]] && return 0
     return 2
   fi
-  if echo "$out" | grep -q 'code object is not signed at all'; then
+  if printf '%s\n' "$out" | grep -q 'code object is not signed at all'; then
     return 1
   fi
   # any other codesign failure: treat as error, NOT silently skip
-  log error "codesign -dv unexpected output for $1 (rc=$rc): $(echo "$out" | head -1)"
+  log error "codesign -dv unexpected output for $1 (rc=$rc): $(printf '%s\n' "$out" | head -1)"
   return 3
 }
 
@@ -364,8 +456,12 @@ sig_state() {
 # Returns 0 if the keychain identity can sign right now.
 preflight_identity() {
   if ! /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
-       | grep -qE "\"${IDENTITY}\""; then
-    log error "preflight: identity '$IDENTITY' not found in keychain (run: brew-autosign setup)"
+       | grep -qF "\"${SIGN_IDENTITY}\""; then
+    if (( IDENTITY_IS_MANAGED )); then
+      log error "preflight: identity '$SIGN_IDENTITY' not found in keychain (run: brew-autosign setup)"
+    else
+      log error "preflight: configured identity '$SIGN_IDENTITY' not found in keychain (run: brew-autosign identity set <name>, or import the cert)"
+    fi
     return 1
   fi
   return 0
@@ -376,13 +472,20 @@ sign_one() {
   is_executable_macho "$bin" || return 0
   local rc=0
   sig_state "$bin"; rc=$?
-  case $rc in
-    0) return 0 ;;  # already ours
-    2) return 0 ;;  # signed by other — never overwrite
-    3) return 1 ;;  # codesign error — surface
-    1) ;;           # unsigned — proceed
-    *) return 1 ;;
-  esac
+  if (( FORCE_RESIGN )); then
+    # explicit resign (e.g. after switching identity): overwrite anything that
+    # is not already our target identity. Runs only over explicitly configured
+    # packages, so replacing a previous signature is the intended action.
+    (( rc == 0 )) && return 0   # already our target identity — idempotent
+  else
+    case $rc in
+      0) return 0 ;;  # already ours
+      2) return 0 ;;  # signed by other — never overwrite (safe default)
+      3) return 1 ;;  # codesign error — surface
+      1) ;;           # unsigned — proceed
+      *) return 1 ;;
+    esac
+  fi
 
   # stability: don't sign a file brew might still be writing
   if ! wait_for_stable_file "$bin"; then
@@ -390,8 +493,8 @@ sign_one() {
     return 1
   fi
 
-  log info "signing $bin"
-  if /usr/bin/codesign --force --sign "$IDENTITY" --timestamp=none "$bin" >>"$LOG" 2>&1; then
+  log info "signing $bin (identity: $SIGN_IDENTITY)"
+  if /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$bin" >>"$LOG" 2>&1; then
     log info "signed OK: $bin"
     return 0
   else
@@ -439,6 +542,13 @@ sign_package() {
 # --- subcommand: sign ----------------------------------------------------
 
 cmd_sign() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) FORCE_RESIGN=1 ;;
+      *) die "usage: brew-autosign sign [--force]" ;;
+    esac
+  done
   require_flock
 
   # rotate log under the sign lock (so two passes don't both rotate)
@@ -468,7 +578,7 @@ cmd_sign() {
       fi
     fi
   fi
-  if (( now - last < DEBOUNCE_SECONDS )); then
+  if (( FORCE_RESIGN == 0 )) && (( now - last < DEBOUNCE_SECONDS )); then
     return 0
   fi
 
@@ -770,18 +880,54 @@ cert_fingerprint() {
     | sed 's/^.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]'
 }
 
+# Emit the ACTIVE signing identity's certificate as PEM on stdout (empty if
+# unavailable). For the managed identity we use the cached public cert; for an
+# external/configured identity (e.g. Apple Development) we export it from the
+# keychain by common name. This lets status report expiry for both kinds.
+active_cert_pem() {
+  if (( IDENTITY_IS_MANAGED )) && [[ -f "$CERT_FILE" ]]; then
+    cat "$CERT_FILE"; return 0
+  fi
+  /usr/bin/security find-certificate -c "$SIGN_IDENTITY" -p 2>/dev/null
+}
+
+# Days until the active identity's cert expires; empty if unknown.
+active_cert_days_left() {
+  local pem end_s end_epoch now_s
+  pem=$(active_cert_pem)
+  [[ -z "$pem" ]] && { echo ""; return; }
+  end_s=$(printf '%s\n' "$pem" | LC_ALL=C openssl x509 -enddate -noout 2>/dev/null | sed 's/^notAfter=//')
+  [[ -z "$end_s" ]] && { echo ""; return; }
+  end_epoch=$(LC_ALL=C date -j -f "%b %d %H:%M:%S %Y %Z" "$end_s" +%s 2>/dev/null || echo 0)
+  (( end_epoch == 0 )) && { echo ""; return; }
+  now_s=$(date +%s)
+  echo $(( (end_epoch - now_s) / 86400 ))
+}
+
+active_cert_fingerprint() {
+  local pem
+  pem=$(active_cert_pem)
+  [[ -z "$pem" ]] && return 1
+  printf '%s\n' "$pem" | openssl x509 -fingerprint -sha256 -noout 2>/dev/null \
+    | sed 's/^.*Fingerprint=//' | tr -d ':' | tr '[:upper:]' '[:lower:]'
+}
+
 cmd_status() {
   # health status
   local status_parts=() status="ok" agent_state="" identity_ok=0
   if /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
-       | grep -qE "\"${IDENTITY}\""; then
+       | grep -qF "\"${SIGN_IDENTITY}\""; then
     # find-identity -p codesigning only lists identities that ARE trusted,
     # so identity_ok=1 already implies trust.
     identity_ok=1
   fi
   if (( identity_ok == 0 )); then
     status="not-set-up"
-    status_parts+=("identity '$IDENTITY' missing — run: brew-autosign setup")
+    if (( IDENTITY_IS_MANAGED )); then
+      status_parts+=("identity '$SIGN_IDENTITY' missing — run: brew-autosign setup")
+    else
+      status_parts+=("configured identity '$SIGN_IDENTITY' missing — run: brew-autosign identity set <name>")
+    fi
   fi
   agent_state=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null \
     | awk -F= '/state =/{sub(/^[ \t]+/,"",$2); sub(/[ \t]+$/,"",$2); print $2; exit}')
@@ -801,14 +947,16 @@ cmd_status() {
       ;;
   esac
   local days
-  days=$(cert_days_left)
+  days=$(active_cert_days_left)
   if [[ -n "$days" ]]; then
+    local warn_days=$EXPIRY_WARN_DAYS
+    (( IDENTITY_IS_MANAGED )) || warn_days=$EXPIRY_WARN_DAYS_EXTERNAL
     if (( days < 0 )); then
       status="degraded"
       status_parts+=("cert EXPIRED (${days#-} days ago)")
-    elif (( days < EXPIRY_WARN_DAYS )); then
+    elif (( days < warn_days )); then
       [[ "$status" == "ok" ]] && status="degraded"
-      status_parts+=("cert expires in $days days")
+      status_parts+=("cert expires in $days days — renew, then: brew-autosign sign --force")
     fi
   fi
   local err_tail=""
@@ -824,9 +972,11 @@ cmd_status() {
   local m
   for m in "${status_parts[@]:-}"; do [[ -n "$m" ]] && echo "  - $m"; done
   echo
-  printf 'identity: %s (%s)\n' "$IDENTITY" "$([[ $identity_ok == 1 ]] && echo present || echo missing)"
+  local idsrc="managed self-signed"
+  (( IDENTITY_IS_MANAGED )) || idsrc="configured override"
+  printf 'identity: %s (%s, %s)\n' "$SIGN_IDENTITY" "$([[ $identity_ok == 1 ]] && echo present || echo missing)" "$idsrc"
   if [[ -n "$days" ]]; then
-    printf 'cert:     %s days remaining (sha256: %s)\n' "$days" "$(cert_fingerprint || echo n/a)"
+    printf 'cert:     %s days remaining (sha256: %s)\n' "$days" "$(active_cert_fingerprint || echo n/a)"
   fi
   printf 'agent:    %s\n' "$agent_state"
   echo
@@ -869,8 +1019,9 @@ cmd_setup() {
   [[ -x /usr/bin/security ]] || die "/usr/bin/security missing"
   [[ -x /usr/bin/codesign ]] || die "/usr/bin/codesign missing"
 
-  echo "→ identity: $IDENTITY"
+  echo "→ signing identity: $SIGN_IDENTITY"
 
+  if (( IDENTITY_IS_MANAGED )); then
   # 1. ensure cert + identity present in keychain; idempotent + resumable.
   # `find-identity -p codesigning` only returns identities that are trusted
   # for the codeSign policy, so identity_present == 1 already implies trust.
@@ -962,6 +1113,23 @@ cmd_setup() {
     echo "→ identity trusted; private key removed from disk"
   fi
 
+  else
+    # external / pre-existing identity (e.g. Apple Development, Developer ID):
+    # brew-autosign does NOT generate or manage it — only verify it is usable.
+    if ! /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+         | grep -qF "\"${SIGN_IDENTITY}\""; then
+      die "configured identity '$SIGN_IDENTITY' not found among codesigning identities; import the cert, or run: brew-autosign identity set <name>"
+    fi
+    echo "→ using existing codesigning identity (not managed by brew-autosign)"
+    echo "  note: for the unattended LaunchAgent to sign without a Keychain prompt,"
+    echo "  this identity's private key must allow non-interactive access by"
+    echo "  codesign. If agent signing hangs or fails, in Keychain Access open the"
+    echo "  key → Access Control → allow /usr/bin/codesign (or 'Allow all"
+    echo "  applications'), or run:"
+    echo "    security set-key-partition-list -S apple-tool:,apple: -s \\"
+    echo "      -k <login-password> ~/Library/Keychains/login.keychain-db"
+  fi
+
   # 2. seed config if missing
   if [[ ! -f "$CONFIG" ]]; then
     local example
@@ -993,6 +1161,10 @@ next:
      "Always Allow" once per item — that binds the new stable signature.
   3. check anytime:
        brew-autosign status
+
+signing identity: $SIGN_IDENTITY
+to switch certs (e.g. an Apple Developer identity) or auto-detect what's
+available:  brew-autosign identity list
 EOF
 }
 
@@ -1050,6 +1222,104 @@ EOF
   echo "✓ purged. existing Keychain ACLs bound to '$IDENTITY' will prompt at next use."
 }
 
+# --- subcommand: identity ------------------------------------------------
+
+_identity_write() {
+  local cn=$1
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "$cn" >"$IDENTITY_CONFIG"
+  chmod 600 "$IDENTITY_CONFIG" 2>/dev/null || true
+}
+
+_identity_clear() { rm -f "$IDENTITY_CONFIG"; }
+
+cmd_identity() {
+  local action="${1:-show}"
+  [[ $# -gt 0 ]] && shift
+  case "$action" in
+    show)
+      local src="managed self-signed"; (( IDENTITY_IS_MANAGED )) || src="configured override"
+      local present="missing"
+      /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+        | grep -qF "\"${SIGN_IDENTITY}\"" && present="present"
+      printf 'active signing identity: %s\n' "$SIGN_IDENTITY"
+      printf 'source:                  %s\n' "$src"
+      printf 'in keychain:             %s\n' "$present"
+      printf 'override config:         %s%s\n' "$IDENTITY_CONFIG" \
+        "$([[ -f "$IDENTITY_CONFIG" ]] && echo "" || echo " (absent → default)")"
+      local days; days=$(active_cert_days_left)
+      [[ -n "$days" ]] && printf 'cert expires in:         %s days\n' "$days"
+      echo
+      cmd_identity list
+      ;;
+    list|detect)
+      hdr "available codesigning identities"
+      local any=0 sha cn kind mark
+      while IFS=$'\t' read -r sha cn; do
+        [[ -z "$cn" ]] && continue
+        any=1
+        case "$cn" in
+          brew-autosign-local)          kind="managed self-signed" ;;
+          "Apple Development:"*)        kind="Apple Development" ;;
+          "Apple Distribution:"*)       kind="Apple Distribution" ;;
+          "Developer ID Application:"*) kind="Developer ID" ;;
+          "Mac Developer:"*)            kind="Mac Developer" ;;
+          *)                            kind="other" ;;
+        esac
+        mark=" "; [[ "$cn" == "$SIGN_IDENTITY" ]] && mark="*"
+        printf '  %s %-20s %s\n' "$mark" "$kind" "$cn"
+      done < <(list_codesign_identities)
+      if (( any == 0 )); then
+        echo "  (none — run: brew-autosign setup to create the managed self-signed identity)"
+      else
+        echo
+        echo "  '*' = active. Switch with: brew-autosign identity set <name|sha1>"
+      fi
+      ;;
+    set)
+      local want="${1:-}"
+      [[ -n "$want" ]] || die "usage: brew-autosign identity set <common-name|sha1>"
+      local canon rc
+      canon=$(canonicalize_identity "$want"); rc=$?
+      if (( rc != 0 )); then
+        (( rc == 2 )) && die "'$want' matches multiple identities; use the full common name or SHA-1 (see: brew-autosign identity list)"
+        die "no codesigning identity matches '$want' (see: brew-autosign identity list)"
+      fi
+      if [[ "$canon" == "$IDENTITY" ]]; then
+        with_config_lock _identity_clear   # selecting the managed identity clears the override
+        echo "→ using managed self-signed identity: $IDENTITY"
+      else
+        with_config_lock _identity_write "$canon"
+        echo "→ signing identity set to: $canon"
+      fi
+      refresh_sign_identity
+      echo "  note: this changes the designated requirement of configured binaries;"
+      echo "  macOS prompts 'Always Allow' once per Keychain item the first time each"
+      echo "  tool reads it under the new signature."
+      echo "→ re-signing configured packages with the new identity"
+      cmd_sign --force
+      cmd_reload
+      ;;
+    reset)
+      if [[ -f "$IDENTITY_CONFIG" ]]; then
+        with_config_lock _identity_clear
+        echo "→ reverted to managed self-signed identity: $IDENTITY"
+      else
+        echo "already using managed self-signed identity: $IDENTITY"
+      fi
+      refresh_sign_identity
+      if ! /usr/bin/security find-identity -p codesigning -v 2>/dev/null \
+           | grep -qF "\"${IDENTITY}\""; then
+        warn "managed identity '$IDENTITY' not present; run: brew-autosign setup"
+      fi
+      echo "  re-sign configured packages with: brew-autosign sign --force"
+      ;;
+    *)
+      die "usage: brew-autosign identity [show|list|set <name>|reset]"
+      ;;
+  esac
+}
+
 # --- help / dispatch -----------------------------------------------------
 
 cmd_help() {
@@ -1061,6 +1331,7 @@ usage_for() {
     add)         echo "usage: brew-autosign add <pkg>[:bin1,bin2,...]" ;;
     remove)      echo "usage: brew-autosign remove <pkg>" ;;
     uninstall)   echo "usage: brew-autosign uninstall [--purge]" ;;
+    identity)    echo "usage: brew-autosign identity [show|list|set <name>|reset]" ;;
     completions) echo "usage: brew-autosign completions <install|uninstall|generate> <zsh|bash|fish|auto>" ;;
     *)           cmd_help ;;
   esac
@@ -1111,6 +1382,7 @@ _brew_autosign() {
     'remove:remove a package'
     'list:per-binary signing state'
     'status:health summary'
+    'identity:show/set the signing identity'
     'uninstall:remove LaunchAgent (or --purge)'
     'completions:manage shell completions'
     'help:show help'
@@ -1124,6 +1396,7 @@ _brew_autosign() {
         add)         _arguments '1: :_ba_formulae' '--help' ;;
         remove)      _arguments '1: :_ba_pkgs' '--help' ;;
         uninstall)   _arguments '--purge' '--help' ;;
+        identity)    _arguments '1: :(show list set reset)' '--help' ;;
         completions) _arguments \
                        '1: :(install uninstall generate)' \
                        '2: :(zsh bash fish auto)' '--help' ;;
@@ -1159,7 +1432,7 @@ _brew_autosign() {
   cmd="${COMP_WORDS[1]:-}"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
-    COMPREPLY=( $(compgen -W "setup sign reload add remove list status uninstall completions help" -- "$cur") )
+    COMPREPLY=( $(compgen -W "setup sign reload add remove list status identity uninstall completions help" -- "$cur") )
     return
   fi
 
@@ -1174,6 +1447,9 @@ _brew_autosign() {
       cfg="${XDG_CONFIG_HOME:-$HOME/.config}/brew-autosign/packages.conf"
       [[ -f "$cfg" ]] && p=$(awk -F'[:[:space:]]' '/^[a-z0-9]/ {print $1}' "$cfg")
       COMPREPLY=( $(compgen -W "$p --help" -- "$cur") )
+      ;;
+    identity)
+      COMPREPLY=( $(compgen -W "show list set reset --help" -- "$cur") )
       ;;
     uninstall)
       COMPREPLY=( $(compgen -W "--purge --help" -- "$cur") )
@@ -1208,7 +1484,7 @@ function __brew_autosign_formulae
   brew list --formula 2>/dev/null
 end
 
-set -l no_sub 'not __fish_seen_subcommand_from setup sign reload add remove list status uninstall completions help'
+set -l no_sub 'not __fish_seen_subcommand_from setup sign reload add remove list status identity uninstall completions help'
 
 complete -c brew-autosign -f
 complete -c brew-autosign -n "$no_sub" -a setup       -d 'one-time setup'
@@ -1218,6 +1494,7 @@ complete -c brew-autosign -n "$no_sub" -a add         -d 'add a package'
 complete -c brew-autosign -n "$no_sub" -a remove      -d 'remove a package'
 complete -c brew-autosign -n "$no_sub" -a list        -d 'signing state'
 complete -c brew-autosign -n "$no_sub" -a status      -d 'health summary'
+complete -c brew-autosign -n "$no_sub" -a identity    -d 'signing identity'
 complete -c brew-autosign -n "$no_sub" -a uninstall   -d 'remove agent'
 complete -c brew-autosign -n "$no_sub" -a completions -d 'manage completions'
 complete -c brew-autosign -n "$no_sub" -a help        -d 'show help'
@@ -1225,6 +1502,7 @@ complete -c brew-autosign -n "$no_sub" -a help        -d 'show help'
 complete -c brew-autosign -n '__fish_seen_subcommand_from add'    -a '(__brew_autosign_formulae)'
 complete -c brew-autosign -n '__fish_seen_subcommand_from remove' -a '(__brew_autosign_packages)'
 complete -c brew-autosign -n '__fish_seen_subcommand_from uninstall' -l purge -d 'also remove cert + config'
+complete -c brew-autosign -n '__fish_seen_subcommand_from identity' -a 'show list set reset'
 complete -c brew-autosign \
   -n '__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from install uninstall generate' \
   -a 'install uninstall generate'
@@ -1332,13 +1610,14 @@ maybe_subcommand_help() {
 
 case "${1:-help}" in
   setup)       shift; maybe_subcommand_help setup "$@"; cmd_setup ;;
-  sign)        shift; maybe_subcommand_help sign "$@"; cmd_sign ;;
+  sign)        shift; maybe_subcommand_help sign "$@"; cmd_sign "$@" ;;
   reload)      shift; maybe_subcommand_help reload "$@"; cmd_reload ;;
   add)         shift; maybe_subcommand_help add "$@"; cmd_add "$@" ;;
   remove)      shift; maybe_subcommand_help remove "$@"; cmd_remove "$@" ;;
   list)        shift; maybe_subcommand_help list "$@"; cmd_list ;;
   status)      shift; maybe_subcommand_help status "$@"; cmd_status ;;
   uninstall)   shift; maybe_subcommand_help uninstall "$@"; cmd_uninstall "$@" ;;
+  identity)    shift; maybe_subcommand_help identity "$@"; cmd_identity "$@" ;;
   completions) shift; maybe_subcommand_help completions "$@"; cmd_completions "$@" ;;
   help|-h|--help) cmd_help ;;
   *) cmd_help >&2; exit 1 ;;
