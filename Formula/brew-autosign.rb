@@ -39,10 +39,16 @@ class BrewAutosign < Formula
           is retained for fingerprint / expiry checks),
         - create #{Tty.bold}~/.config/brew-autosign/packages.conf#{Tty.reset},
         - install a LaunchAgent that re-signs configured Homebrew binaries
-          after every `brew upgrade` and runs a backstop sign pass hourly.
+          after every `brew upgrade` and runs a backstop sign pass every
+          30 minutes.
 
       Then add packages whose Keychain ACLs you want kept stable:
         brew-autosign add fnox
+
+      To sign with your own Apple Developer / Developer ID cert instead of
+      the managed self-signed one (auto-detected from your keychain):
+        brew-autosign identity list
+        brew-autosign identity set <name>
 
       Health check anytime:
         brew-autosign status

@@ -60,6 +60,8 @@ Expect:
 designated => identifier <tool> and certificate leaf = H"<40-char-sha1>"
 ```
 
+(With an Apple-issued identity the DR instead reads `identifier "<tool>" and anchor apple generic and certificate leaf[subject.CN] = "Apple Development: …"` — it matches by **common name**, not a fixed hash, and the `openssl … codesign.crt` cross-check below applies only to the managed self-signed cert.)
+
 That `H"..."` is the SHA-1 fingerprint of your local cert. Cross-check:
 
 ```sh
@@ -78,6 +80,31 @@ codesign -d --requirements - /usr/local/bin/<pkg>
 ```
 
 The DR after reinstall must be byte-identical to the DR before reinstall. If it is, no further Always-Allow prompts should appear for already-authorized secrets.
+
+## Symptom: prompts came back after I added an Apple Developer (or other) code-signing cert
+
+The most common "it suddenly stopped working" cause. Keychain ACLs bind to the **designated requirement** of whatever signed the tool **at the moment you clicked "Always Allow"**. If a *second* codesigning identity enters the picture — e.g. you enrolled in Apple Developer and an `Apple Development: …` cert landed in your login keychain — and the tool was signed by *that* identity when you (re)authorized, your ACLs are now bound to it. The next `brew upgrade` yields an unsigned binary, brew-autosign re-signs it with **its** identity, the DR no longer matches what the ACLs expect, and every secret re-prompts at once.
+
+Diagnose — what's active vs. what's actually on the binary:
+
+```sh
+brew-autosign identity list                          # identities present; '*' = active
+codesign -dv --verbose=2 /usr/local/bin/<tool> 2>&1 | grep Authority
+```
+
+Pick one canonical identity, make brew-autosign use it, then re-sign:
+
+```sh
+# Option A — standardize on your Apple Developer / Developer ID cert:
+brew-autosign identity set "Apple Development: you@example.com (TEAMID)"
+
+# Option B — standardize on the managed self-signed cert:
+brew-autosign identity reset && brew-autosign sign --force
+```
+
+`identity set` runs a forced re-sign itself; `reset` does not, so chain `sign --force`. Then read each secret once and click **"Always Allow"** — from then on the ACLs are bound to a single identity that brew-autosign re-applies on every upgrade, so they stay valid.
+
+`brew-autosign list` shows `by-other` for any configured binary signed by an identity other than the active one — a quick way to spot a third identity re-signing your tools.
 
 ## Symptom: `setup` says "MAC verification failed during PKCS12 import"
 
@@ -173,15 +200,23 @@ This is unsupported. Each user's login keychain holds an independent `brew-autos
 - Pick one user as the "signing user" and have other users accept that their Keychain ACLs will not be auto-maintained, or
 - Each user accepts the one-time "Always Allow" cycle independently after install.
 
-## Symptom: `status` says "cert expires in N days" (N < 365)
+## Symptom: `status` says "cert expires in N days"
 
-The local cert is approaching its 10-year expiry. Plan a rotation: it will force the one-time "Always Allow" Keychain prompts again (because the new identity has a different DR), so schedule it for a quiet moment.
+For the **managed self-signed** identity the warning window is 365 days — the cert is approaching its 10-year expiry. Plan a rotation: it forces the one-time "Always Allow" Keychain prompts again (the new identity has a different DR), so schedule it for a quiet moment.
 
 ```sh
 brew-autosign uninstall --purge        # delete current identity + cert
 brew-autosign setup                    # generate a fresh 10-year cert
 brew-autosign reload                   # re-sign pass + agent reload
 ```
+
+For an **external** identity (Apple Development / Developer ID) the window is 30 days. Renew the cert through your normal Apple workflow, then re-apply it:
+
+```sh
+brew-autosign sign --force             # re-sign configured binaries with the renewed cert
+```
+
+Because the DR matches by common name, a renewal that keeps the same CN needs no re-authorization. If the CN changed, the one-time "Always Allow" prompts return.
 
 ## Symptom: I want to start over from scratch
 
