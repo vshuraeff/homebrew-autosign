@@ -2,7 +2,7 @@
 
 All notable changes to brew-autosign. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] — 2026-06-13
 
 ### Added
 
