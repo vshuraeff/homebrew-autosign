@@ -6,8 +6,8 @@
 #   setup           one-time setup: generate cert, import to keychain, install agent
 #   sign            run a signing pass now (idempotent; used by the LaunchAgent)
 #   reload          regenerate the LaunchAgent plist from packages.conf and reload it
-#   add <pkg>       append <pkg>[:bin1,bin2,...] to packages.conf and reload
-#   remove <pkg>    remove <pkg> from packages.conf and reload
+#   add <entry>     append <pkg>[:bin1,bin2,...] or a binary path (/… or ~/…) to packages.conf and reload
+#   remove <entry>  remove <pkg> or a path entry from packages.conf and reload
 #   list            show configured packages and their current signing status
 #   status          health summary, agent state, watched paths, recent log
 #   identity        show/list/set/reset the signing identity (auto-detected)
@@ -291,6 +291,7 @@ read_config() {
     line="${line%%#*}"
     line=$(trim "$line")
     [[ -z "$line" ]] && continue
+    is_path_entry "$line" && continue   # path entries: see read_path_config
     if [[ "$line" == *":"* ]]; then
       pkg="${line%%:*}"; bins="${line#*:}"
     else
@@ -319,6 +320,163 @@ read_config() {
     fi
     printf '%s\t%s\n' "$pkg" "$bins"
   done <"$CONFIG"
+  return 0
+}
+
+# --- path entries --------------------------------------------------------
+#
+# A config line starting with `/` or `~/` names one binary by path instead of a
+# brew package: for tools installed outside Homebrew (eget, cargo install, a
+# release tarball). Such a binary usually carries its vendor's signature, which
+# is exactly what breaks a Keychain ACL recorded for a locally signed build, so
+# a path entry is re-signed whenever its signer is not ours, with identifier
+# = the configured entry's file name (the identifier codesign derives for an
+# unsigned brew build), keeping the designated requirement stable across sources.
+
+# the `~/` here is the literal text of a config line, never shell-expanded
+is_path_entry() { [[ "$1" == /* || "$1" == \~/* ]]; }
+
+expand_path_entry() {
+  local p=$1
+  [[ "$p" == \~/* ]] && p="$HOME/${p#\~/}"
+  printf '%s\n' "$p"
+}
+
+# Validate a path entry as written in the config. Returns 0 on accept.
+valid_path_entry() {
+  local raw=$1 p seg
+  is_path_entry "$raw" || return 1
+  # '#' would be cut as a comment by the reader; ':' and whitespace/control
+  # characters are refused to keep the line format unambiguous
+  [[ "$raw" == *[\#:[:space:][:cntrl:]]* ]] && return 1
+  p=$(expand_path_entry "$raw")
+  [[ "$p" == /* ]] || return 1
+  local IFS=/
+  for seg in $p; do
+    [[ "$seg" == ".." ]] && return 1
+  done
+  [[ "${p##*/}" != "" ]] || return 1
+  return 0
+}
+
+# yields one line per valid path entry: <as written>\t<expanded path>
+read_path_config() {
+  [[ -f "$CONFIG" ]] || return 0
+  local line lineno=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lineno=$((lineno+1))
+    line="${line%%#*}"
+    line=$(trim "$line")
+    [[ -z "$line" ]] && continue
+    is_path_entry "$line" || continue
+    if ! valid_path_entry "$line"; then
+      warn "$CONFIG:$lineno: invalid path entry '$line' (rejected)"
+      continue
+    fi
+    printf '%s\t%s\n' "$line" "$(expand_path_entry "$line")"
+  done <"$CONFIG"
+  return 0
+}
+
+# rc 0 when $1 carries an ACL entry that grants anything. `ls -le` prints each
+# entry as " N: <who> allow|deny <perms>"; a deny entry cannot widen access, an
+# allow entry can grant write regardless of the mode bits.
+has_acl_allow() {
+  /bin/ls -led -- "$1" 2>/dev/null | grep -qE '^ *[0-9]+: .* allow '
+}
+
+# Writable only by its owner: owned by this uid (or root when $2 is root-ok),
+# no group/other write bit, no ACL allow entry. Logs the reason on refusal.
+owner_only() {
+  local x=$1 root_ok=${2:-} uid owner mode
+  uid=$(id -u)
+  owner=$(stat -f %u "$x" 2>/dev/null) || return 1
+  [[ "$owner" == "$uid" || ( -n "$root_ok" && "$owner" == 0 ) ]] || { log warn "skip: $x is not owned by uid $uid"; return 1; }
+  mode=$(stat -f %Lp "$x" 2>/dev/null) || return 1
+  (( (8#$mode & 8#022) == 0 )) || { log warn "skip: $x is group/world-writable"; return 1; }
+  ! has_acl_allow "$x" || { log warn "skip: $x has an ACL allow entry"; return 1; }
+}
+
+# Resolve symlinks to the physical file. Echoes the path; rc 1 if unresolvable.
+# With $2 = check, every directory on the way must be owner_only (a symlink's
+# directory may be root's), and so must the file: anyone else able to write one
+# of them could retarget the entry at a file the user never listed.
+resolve_path_target() {
+  local p=$1 check=${2:-} dir link n=0
+  while [[ -L "$p" ]]; do
+    (( n++ > 32 )) && return 1
+    dir=$(cd -P "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+    [[ -z "$check" ]] || owner_only "$dir" root-ok || return 1
+    link=$(readlink "$p") || return 1
+    [[ "$link" == /* ]] && p=$link || p="$dir/$link"
+  done
+  dir=$(cd -P "$(dirname "$p")" 2>/dev/null && pwd) || return 1
+  p="$dir/${p##*/}"
+  if [[ -n "$check" ]]; then
+    owner_only "$dir" && owner_only "$p" || return 1
+  fi
+  printf '%s\n' "$p"
+}
+
+file_identity() { stat -f '%d:%i:%z:%m' "$1" 2>/dev/null; }
+
+# Sign one path entry. rc 0 = ok or nothing to do, 1 = failure.
+# The identifier is the configured entry's file name, so a versioned symlink
+# (bin/fnox -> versions/fnox-1.2) keeps one designated requirement across updates.
+# The object signed must be the object checked, and codesign follows a symlink
+# given to it, so it never gets the configured path: after the stability wait
+# the entry is resolved and checked again, a copy made beside the file is
+# signed, and the copy is renamed over the file only while the file is still
+# the one checked. A change at any of those points skips the file with a log
+# line and the trigger that change fires signs the new one. The rename window
+# left after the last comparison is reachable only by the directory's owner.
+sign_path_one() {
+  local raw=$1 p=$2 target dir id tmp rc=0 name=${2##*/}
+  if [[ ! -e "$p" ]]; then
+    log info "skip: $raw not present"
+    return 0
+  fi
+  target=$(resolve_path_target "$p" check) || { log warn "skip $raw: not resolvable to a file only you can change"; return 1; }
+  is_executable_macho "$target" || { log warn "skip $raw: $target is not an executable Mach-O"; return 0; }
+  sig_state "$target"; rc=$?
+  case $rc in
+    0) return 0 ;;   # already ours
+    1|2) ;;          # unsigned or vendor-signed: re-sign (the reason for the entry)
+    *) return 1 ;;
+  esac
+  if ! wait_for_stable_file "$target"; then
+    log warn "skip $target: file did not stabilize"
+    return 1
+  fi
+  if [[ "$(resolve_path_target "$p" check)" != "$target" ]]; then
+    log warn "skip $raw: it changed during the pass"
+    return 1
+  fi
+  id=$(file_identity "$target") || return 1
+  dir=${target%/*}
+  tmp=$(mktemp "$dir/.${target##*/}.autosign.XXXXXX") || { log error "cannot create a temp file in $dir"; return 1; }
+  if ! cp -p "$target" "$tmp" || [[ "$(file_identity "$target")" != "$id" ]]; then
+    rm -f -- "$tmp"
+    log warn "skip $raw: it changed during the pass"
+    return 1
+  fi
+  log info "signing $target (identity: $SIGN_IDENTITY, identifier: $name)"
+  if ! /usr/bin/codesign --force --sign "$SIGN_IDENTITY" --identifier "$name" --timestamp=none "$tmp" >>"$LOG" 2>&1; then
+    rm -f -- "$tmp"
+    log error "codesign failed for $target"
+    return 1
+  fi
+  if [[ "$(file_identity "$target")" != "$id" ]] || [[ -L "$target" ]]; then
+    rm -f -- "$tmp"
+    log warn "skip $raw: it changed during the pass"
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    log error "cannot replace $target with its signed copy"
+    return 1
+  fi
+  log info "signed OK: $target"
   return 0
 }
 
@@ -352,6 +510,19 @@ watch_paths() {
       [[ -d "$prefix/opt" ]] && echo "$prefix/opt"
     done
   fi
+  # path entries: the directory holding the file changes when an installer
+  # replaces it (eget removes the old file and creates a new one; others
+  # rename one in); for a symlink, the directory of its physical target too,
+  # captured at reload, so a link later retargeted into another directory is
+  # covered there only after `reload` or by the periodic backstop
+  local _raw p t
+  while IFS=$'\t' read -r _raw p || [[ -n "$_raw" ]]; do
+    [[ -z "$p" ]] && continue
+    [[ -d "$(dirname "$p")" ]] && dirname "$p"
+    if [[ -e "$p" ]] && t=$(resolve_path_target "$p"); then
+      [[ "$t" != "$p" ]] && dirname "$t"
+    fi
+  done < <(read_path_config)
   return 0
 }
 
@@ -369,6 +540,11 @@ unwatched_packages() {
     done
     (( found == 0 )) && echo "$pkg"
   done < <(read_config)
+  local raw p
+  while IFS=$'\t' read -r raw p || [[ -n "$raw" ]]; do
+    [[ -z "$raw" ]] && continue
+    [[ -e "$p" ]] || echo "$raw"
+  done < <(read_path_config)
   return 0
 }
 
@@ -445,6 +621,11 @@ sig_state() {
     return 2
   fi
   if printf '%s\n' "$out" | grep -q 'code object is not signed at all'; then
+    return 1
+  fi
+  # an ad-hoc signature (the linker's, on any binary built locally) names no
+  # signer and gives a Keychain ACL nothing stable to hold on to: same as unsigned
+  if printf '%s\n' "$out" | grep -q '^Signature=adhoc'; then
     return 1
   fi
   # any other codesign failure: treat as error, NOT silently skip
@@ -594,6 +775,11 @@ cmd_sign() {
     [[ -z "$pkg" ]] && continue
     sign_package "$pkg" "$bins"
   done < <(read_config)
+  local raw p
+  while IFS=$'\t' read -r raw p || [[ -n "$raw" ]]; do
+    [[ -z "$raw" ]] && continue
+    sign_path_one "$raw" "$p" || SIGN_FAILS=$((SIGN_FAILS+1))
+  done < <(read_path_config)
 
   echo "$now" >"$LAST_RUN"
 
@@ -745,8 +931,26 @@ config_check_warn_not_installed() {
   (( found == 0 )) && warn "$pkg is not installed in any Homebrew prefix; agent will start watching it after \`brew install $pkg && brew-autosign reload\`"
 }
 
+_cmd_add_path_inner() {
+  local raw=$1 line
+  valid_path_entry "$raw" || die "invalid path '$raw' (absolute or ~/, no '..', ':', '#' or whitespace)"
+  [[ -f "$CONFIG" ]] || touch "$CONFIG"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(trim "${line%%#*}")
+    [[ "$line" == "$raw" ]] && { echo "already present: $raw"; return 0; }
+  done <"$CONFIG"
+  printf '%s\n' "$raw" >>"$CONFIG"
+  [[ -e "$(expand_path_entry "$raw")" ]] || warn "$raw does not exist yet; the agent signs it once it appears"
+  return 0
+}
+
 _cmd_add_inner() {
   local raw=$1 normalized key
+  raw=$(trim "$raw")
+  if is_path_entry "$raw"; then
+    _cmd_add_path_inner "$raw"
+    return
+  fi
   normalized=$(parse_entry "$raw") || return 1
   key="${normalized%%:*}"
   [[ -f "$CONFIG" ]] || touch "$CONFIG"
@@ -760,14 +964,19 @@ _cmd_add_inner() {
 }
 
 cmd_add() {
-  [[ $# -ge 1 ]] || die "usage: brew-autosign add <pkg>[:bin1,bin2,...]"
+  [[ $# -ge 1 ]] || die "usage: brew-autosign add <pkg>[:bin1,bin2,...] | <path>"
   with_config_lock _cmd_add_inner "$1" || return 1
   cmd_reload
 }
 
 _cmd_remove_inner() {
-  local pkg=$1
-  valid_pkg_name "$pkg" || die "invalid package name '$pkg'"
+  local pkg
+  pkg=$(trim "$1")
+  if is_path_entry "$pkg"; then
+    valid_path_entry "$pkg" || die "invalid path '$pkg'"
+  else
+    valid_pkg_name "$pkg" || die "invalid package name '$pkg'"
+  fi
   [[ -f "$CONFIG" ]] || die "no config at $CONFIG"
   # use literal-string per-line match to avoid regex injection.
   # cmd_remove targets the FIRST whitespace-delimited token on each line.
@@ -799,7 +1008,7 @@ _cmd_remove_inner() {
 }
 
 cmd_remove() {
-  [[ $# -ge 1 ]] || die "usage: brew-autosign remove <pkg>"
+  [[ $# -ge 1 ]] || die "usage: brew-autosign remove <pkg> | <path>"
   with_config_lock _cmd_remove_inner "$1" || return 1
   cmd_reload
 }
@@ -854,6 +1063,16 @@ cmd_list() {
     done
     (( found == 0 )) && printf '%-24s %-30s %-12s %s\n' "$pkg" "-" "absent" "(not installed)"
   done < <(read_config)
+  local raw p t
+  while IFS=$'\t' read -r raw p || [[ -n "$raw" ]]; do
+    [[ -z "$raw" ]] && continue
+    if [[ ! -e "$p" ]]; then
+      printf '%-24s %-30s %-12s %s\n' "(path)" "${p##*/}" "absent" "$raw (not present)"
+      continue
+    fi
+    t=$(resolve_path_target "$p") || t=$p
+    printf '%-24s %-30s %-12s %s\n' "(path)" "${t##*/}" "$(status_of "$t")" "$t"
+  done < <(read_path_config)
   return 0
 }
 
@@ -1328,8 +1547,8 @@ cmd_help() {
 
 usage_for() {
   case "$1" in
-    add)         echo "usage: brew-autosign add <pkg>[:bin1,bin2,...]" ;;
-    remove)      echo "usage: brew-autosign remove <pkg>" ;;
+    add)         echo "usage: brew-autosign add <pkg>[:bin1,bin2,...] | <path>   (path: /… or ~/…, a binary installed outside Homebrew)" ;;
+    remove)      echo "usage: brew-autosign remove <pkg> | <path>" ;;
     uninstall)   echo "usage: brew-autosign uninstall [--purge]" ;;
     identity)    echo "usage: brew-autosign identity [show|list|set <name>|reset]" ;;
     completions) echo "usage: brew-autosign completions <install|uninstall|generate> <zsh|bash|fish|auto>" ;;
