@@ -1,8 +1,8 @@
 class BrewAutosign < Formula
   desc "Auto-sign unsigned brew binaries to keep Keychain ACLs valid across upgrades"
   homepage "https://github.com/vshuraeff/homebrew-autosign"
-  url "https://github.com/vshuraeff/homebrew-autosign/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "e4a26e33b2c4ed06537e8bd514d04d0f03e17d3ea2939b8feca0b49b7cce5c6f"
+  url "https://github.com/vshuraeff/homebrew-autosign/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "dc7165a41a1711fa1841ef29c11c58cd0dcf7798c8aa6fc5f1582f412874e607"
   license "MIT"
   head "https://github.com/vshuraeff/homebrew-autosign.git", branch: "master"
 
