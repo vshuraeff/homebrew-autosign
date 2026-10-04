@@ -18,7 +18,7 @@ Key properties:
 - **Configurable identity.** Signs with a managed self-signed cert by default, but can use **any** codesigning identity in your keychain — e.g. an Apple Development or Developer ID cert — via `brew-autosign identity`. Available identities are auto-detected; nothing is hardcoded.
 - **Survives Homebrew self-updates** (LaunchAgent does not depend on brew's machinery).
 - **Survives upstream formula changes** (no local tap to keep in sync).
-- **Safe by default.** Only **currently unsigned** Mach-O binaries are signed. Binaries already signed by someone else (Apple, the vendor) are never touched. Codesign errors are surfaced, never silently confused with "signed by other".
+- **Safe by default.** For package entries only **currently unsigned** Mach-O binaries are signed (an ad-hoc linker signature counts as unsigned); binaries already signed by someone else (Apple, the vendor) are never touched. Path entries, which you add precisely to replace a vendor signature, are the one exception. Codesign errors are surfaced, never silently confused with "signed by other".
 - **Provenance-gated.** Only signs binaries inside Homebrew-installed kegs (those with `INSTALL_RECEIPT.json`). Refuses to sign arbitrary files dropped into `Cellar` by anything other than `brew install`.
 - **Private key never persists on disk** beyond the import moment. After `security import`, the `.key` and `.p12` files are deleted; only the public `.crt` is kept for diagnostics.
 - **Idempotent.** Already-signed-by-us binaries are skipped.
@@ -69,7 +69,7 @@ After install, on first use of a Keychain-backed tool (e.g. `fnox`), macOS will 
 
 ## Config
 
-`~/.config/brew-autosign/packages.conf` — one entry per line, two forms:
+`~/.config/brew-autosign/packages.conf` — one entry per line, three forms:
 
 ```
 # Form 1: sign every unsigned Mach-O executable in the package's bin/
@@ -77,12 +77,16 @@ fnox
 
 # Form 2: only specific binaries inside the package
 my-pkg:cli,daemon
+
+# Form 3: one binary installed outside Homebrew (eget, cargo install, a release tarball)
+~/.local/bin/fnox
 ```
 
 Fields:
 
 - **`<package>`** — exact Homebrew formula name as it appears under `Cellar/`. For tap-installed formulae use the leaf name (e.g. `fnox`, not `user/tap/fnox`).
 - **`<binary>`** — file name inside the package's `bin/` directory.
+- **path** — a line starting with `/` or `~/` names the binary itself (symlinks are followed to the real file). Such a binary usually carries its vendor's signature, which is exactly what invalidates a Keychain ACL recorded for a locally signed build, so a path entry is re-signed whenever its signer is not your identity, with the entry's own file name as the code identifier — the identifier a locally built, unsigned binary gets — so the Keychain sees the same requirement whichever way the tool was installed, and a versioned symlink (`bin/fnox -> versions/fnox-1.2`) keeps it across updates. The file and its directory must be owned by you, and every directory holding a symlink on the way by you or root; none of them may be group- or world-writable or carry an ACL allow entry, and anything else is skipped. `/usr/local/bin` is group-writable on Intel Homebrew, so name the real file (e.g. `~/.local/bin/fnox`) rather than a link there. The signature is applied to a copy beside the file, which replaces it only if the file did not change meanwhile. The agent watches the file's directory, so a reinstall (e.g. `eget -D`) is re-signed automatically. `brew-autosign add ~/.local/bin/fnox` adds one.
 
 `#` starts a comment. Whitespace is trimmed. After editing, run `brew-autosign reload`.
 

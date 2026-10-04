@@ -5,7 +5,7 @@
 # stay valid across upgrades.
 #
 # ─── Syntax ───────────────────────────────────────────────────────────────
-# One entry per line. Two forms are supported:
+# One entry per line. Three forms are supported:
 #
 #   <package>
 #       Sign every UNSIGNED Mach-O executable found in
@@ -18,7 +18,20 @@
 #       directory. Useful when a package ships many tools and you only need
 #       a subset re-signed.
 #
+#   /absolute/path/to/binary   or   ~/path/to/binary
+#       One binary installed outside Homebrew (eget, cargo install, a release
+#       tarball). Symlinks are followed to the real file. Unlike package
+#       entries, a path entry IS re-signed when its signer is not ours — a
+#       vendor signature is exactly what breaks the Keychain ACL — with the
+#       entry's own file name as the code identifier (two entries leading to
+#       one file: the first one listed names it). The file and its directory
+#       must be owned by you, every directory holding a symlink on the way by
+#       you or root, and none may be group/world-writable or carry an ACL
+#       allow entry. The agent watches the directory, so a reinstall is
+#       re-signed automatically.
+#
 # Whitespace is ignored. Comments start with `#`. Blank lines are ignored.
+# Path entries may not contain '#', ':', '..' or whitespace.
 #
 # ─── Fields ───────────────────────────────────────────────────────────────
 #   <package>   — the exact Homebrew formula name as installed (matches the
@@ -32,6 +45,8 @@
 #   - signed by us           → skipped (idempotent)
 #   - signed by someone else → skipped (Apple / vendor signature preserved)
 #   - not signed at all      → signed with the active identity
+#     (an ad-hoc linker signature counts as not signed)
+# Path entries are the exception above: they are re-signed unless already ours.
 # (An explicit `brew-autosign sign --force` re-signs configured binaries even if
 # already signed — used when switching identities. It only touches packages
 # listed here, never arbitrary files.)
